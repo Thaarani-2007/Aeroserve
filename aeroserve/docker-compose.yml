@@ -1,0 +1,130 @@
+services:
+  api-gateway:
+    build:
+      context: .
+      dockerfile: ./gateway/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://aeroserve:${POSTGRES_PASSWORD:-aeroserve_password}@postgres:5432/aeroserve_logs
+      - ENVIRONMENT=production
+    volumes:
+      - ./models:/app/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2-alpine
+    # Exposing ports removed for production isolation. Internal services reach redis:6379 directly.
+    # ports:
+    #   - "127.0.0.1:6379:6379"  # Use loopback only if debugging locally outside docker
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aeroserve}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aeroserve_password}
+      POSTGRES_DB: ${POSTGRES_DB:-aeroserve_logs}
+    # No public port binding; accessible only on internal compose network
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aeroserve} -d ${POSTGRES_DB:-aeroserve_logs}"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://aeroserve:${POSTGRES_PASSWORD:-aeroserve_password}@postgres:5432/aeroserve_logs
+    volumes:
+      - ./models:/app/models
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: always
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: ./scheduler/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    # Port 8001 remains internal to docker network; Prometheus scrapes it at http://scheduler:8001
+    volumes:
+      - ./models:/app/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  autoscaler:
+    build:
+      context: .
+      dockerfile: ./autoscaler/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./models:/app/models:ro
+      - ./docker-compose.yml:/app/docker-compose.yml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    # Scrapes scheduler and gateway internally
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    depends_on:
+      - scheduler
+      - api-gateway
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  postgres_data:
+  grafana_data:

@@ -1,0 +1,26 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Scrape Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Scrape the Health-Aware Scheduler (Queue Depth & Age)
+  - job_name: 'aeroserve_scheduler'
+    static_configs:
+      # Matches the docker-compose service name and the port we exposed
+      - targets: ['scheduler:8001']
+
+  # Scrape the API Gateway (Arrival Rate & p95 Latency)
+  - job_name: 'aeroserve_gateway'
+    static_configs:
+      # Assuming your gateway service is named 'api-gateway' or 'gateway'
+      # We will instrument this next!
+      - targets: ['api-gateway:8000']
+
+  - job_name: 'aeroserve_workers'
+    static_configs:
+      - targets: ['worker:8002']    

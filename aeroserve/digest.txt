@@ -1,0 +1,2989 @@
+Directory structure:
+└── aeroserve/
+    ├── README.md
+    ├── burst_test.py
+    ├── cd
+    ├── cli.py
+    ├── config.py
+    ├── docker
+    ├── docker-compose.yml
+    ├── load_test.py
+    ├── load_test2.py
+    ├── prometheus.yml
+    ├── pyproject.toml
+    ├── autoscaler/
+    │   ├── Dockerfile
+    │   ├── main.py
+    │   └── requirements.txt
+    ├── gateway/
+    │   ├── __init__.py
+    │   ├── Dockerfile
+    │   ├── main.py
+    │   ├── requirements.txt
+    │   ├── schemas.py
+    │   └── tests/
+    │       ├── __init__.py
+    │       ├── test_health.py
+    │       └── test_predict.py
+    ├── models/
+    │   ├── __init__.py
+    │   ├── aeroserve_preprocessor.py
+    │   └── iris_model/
+    │       ├── iris_pipeline.joblib
+    │       ├── model_config.json
+    │       ├── processor.py
+    │       └── test_inputs.json
+    ├── scheduler/
+    │   ├── __init__.py
+    │   ├── Dockerfile
+    │   ├── main.py
+    │   ├── requirements.txt
+    │   ├── rerouter.py
+    │   └── state_machine.py
+    ├── tests/
+    │   ├── conftest.py
+    │   ├── e2e/
+    │   │   ├── test_autoscaling.py
+    │   │   └── test_live_resilience.py
+    │   └── unit/
+    │       ├── test_scheduler_rerouter.py
+    │       ├── test_scheduler_state_machine.py
+    │       ├── test_worker_fetcher.py
+    │       ├── test_worker_heartbeat.py
+    │       └── test_worker_kill_recovery.py
+    ├── tools/
+    │   ├── __init__.py
+    │   └── profiler.py
+    └── worker/
+        ├── __init__.py
+        ├── Dockerfile
+        ├── heartbeat.py
+        ├── main.py
+        ├── requirements.txt
+        ├── benchmarks/
+        │   └── live_demo.py
+        └── tests/
+            ├── __init__.py
+            ├── test_heartbeat.py
+            ├── test_pipeline.py
+            └── test_worker.py
+
+================================================
+FILE: README.md
+================================================
+# AeroServe PaaS
+
+A lightweight Platform-as-a-Service (PaaS) designed to serve machine learning models efficiently in production environments.
+
+## Quickstart Local Setup
+
+Start the entire local infrastructure in under 5 commands[cite: 1]:
+
+```bash
+# 1. Clone the repository and navigate into it
+git clone <your-repo-url> && cd aeroserve
+
+# 2. Build and start the services (Gateway, Redis, Postgres)
+docker compose up --build -d
+
+# 3. Verify all services are healthy
+docker compose ps
+
+# 4. Test the API Gateway liveness endpoint
+curl http://localhost:8000/health
+
+
+================================================
+FILE: burst_test.py
+================================================
+import threading
+import requests
+import time
+
+def fire_request():
+    url = "http://localhost:8000/predict"
+    payload = {
+        "model_name": "resnet50_classifier",
+        "priority": "background",
+        "payload": {"data": "burst_test"}
+    }
+    while True: # Keep firing continuously
+        try:
+            requests.post(url, json=payload)
+        except Exception:
+            pass
+        time.sleep(0.1) # Small delay to prevent crashing your own machine
+
+print("Starting sustained load test (Press Ctrl+C to stop)...")
+threads = []
+for _ in range(20):
+    t = threading.Thread(target=fire_request, daemon=True)
+    t.start()
+    threads.append(t)
+
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("Stopped!")
+
+
+================================================
+FILE: cd
+================================================
+[Empty file]
+
+
+================================================
+FILE: cli.py
+================================================
+import argparse
+import json
+import os
+import shutil
+import sys
+import time
+import urllib.request
+import urllib.error
+
+# Ensure imports work from the root directory
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tools.profiler import run_profiling
+
+def main():
+    parser = argparse.ArgumentParser(prog="aeroserve", description="AeroServe PaaS CLI Tooling")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    submit_cmd = subparsers.add_parser("submit", help="Profile and register a local model package")
+    submit_cmd.add_argument("--model-dir", type=str, required=True, help="Path to folder containing processor.py & test_inputs.json")
+    submit_cmd.add_argument("--name", type=str, required=True, help="Registry name for the model")
+    submit_cmd.add_argument("--framework", type=str, default="transformers", choices=["transformers", "pytorch", "tensorflow", "onnx", "custom"])
+    submit_cmd.add_argument("--sla", type=float, default=None, help="Latency target threshold in milliseconds")
+    submit_cmd.add_argument("--processor-class", type=str, default=None, help="Exact class name to load from processor.py (Optional)")
+
+    args = parser.parse_args()
+
+    if args.command == "submit":
+        abs_model_dir = os.path.abspath(args.model_dir)
+        inputs_file = os.path.join(abs_model_dir, "test_inputs.json")
+        processor_file = os.path.join(abs_model_dir, "processor.py")
+
+        if not os.path.isfile(processor_file):
+            print(f"[-] Missing processor implementation: {processor_file}")
+            sys.exit(1)
+
+        if not os.path.isfile(inputs_file):
+            print(f"[-] Missing test inputs: {inputs_file}")
+            sys.exit(1)
+
+        with open(inputs_file, "r") as f:
+            try:
+                test_records = json.load(f)
+                if not isinstance(test_records, list) or len(test_records) == 0:
+                    raise ValueError("Must contain a non-empty JSON array")
+            except Exception as e:
+                print(f"[-] Invalid test_inputs.json format: {e}")
+                sys.exit(1)
+
+        # Run profiling securely
+        generated_config = run_profiling(
+            model_name=args.name,
+            source_dir=abs_model_dir,
+            framework=args.framework,
+            sla_target_ms=args.sla,
+            test_inputs=test_records,
+            output_dir=abs_model_dir,
+            target_class_name=args.processor_class
+        )
+
+        # Atomic Deployment
+        live_models_dir = os.path.abspath("models")
+        temp_model_dir = os.path.join(live_models_dir, f".tmp_{args.name}")
+        final_model_dir = os.path.join(live_models_dir, args.name)
+
+        if os.path.exists(temp_model_dir):
+            shutil.rmtree(temp_model_dir)
+        os.makedirs(temp_model_dir, exist_ok=True)
+
+        print("\n[*] Transferring model artifacts...")
+        for item in os.listdir(abs_model_dir):
+            src_item = os.path.join(abs_model_dir, item)
+            dst_item = os.path.join(temp_model_dir, item)
+            if os.path.isfile(src_item):
+                shutil.copy2(src_item, dst_item)
+
+        # Atomic Swap: Instantly replaces the old model or provisions a new one safely
+        if os.path.exists(final_model_dir):
+            shutil.rmtree(final_model_dir)
+        os.rename(temp_model_dir, final_model_dir)
+        print("[+] Artifacts deployed safely via atomic swap.")
+
+        # Verification
+        print("[*] Waiting for AeroServe gateway and workers to acknowledge the model...")
+        max_retries = 30
+        is_ready = False
+        
+        for attempt in range(max_retries):
+            try:
+                # We will ensure the Gateway has a /health endpoint that checks active models later
+                req = urllib.request.Request(f"http://localhost:8000/health")
+                with urllib.request.urlopen(req, timeout=2) as response:
+                    if response.status == 200:
+                        health_data = json.loads(response.read().decode('utf-8'))
+                        
+                        # Verify our specific model is in the active registry
+                        if args.name in health_data.get("models_loaded", []):
+                            is_ready = True
+                            break
+            except urllib.error.URLError:
+                pass
+            
+            time.sleep(1)
+            print(".", end="", flush=True)
+
+        if not is_ready:
+            print("\n[-] Deployment warning: Files deployed, but Gateway healthcheck timed out.")
+            sys.exit(1)
+
+        print(f"\n[+] Zero-Touch Deployment Complete & Verified!")
+        print(f"    - Endpoint available at: POST /predict")
+        print(f"    - Model Name: {args.name}")
+        print(f"    - Max Batch Size: {generated_config['batching']['max_batch_size']}")
+
+if __name__ == "__main__":
+    main()
+
+
+================================================
+FILE: config.py
+================================================
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    # Application
+    PROJECT_NAME: str = "AeroServe Gateway"
+    ENVIRONMENT: str = "development"
+
+    # Infrastructure
+    REDIS_URL: str = "redis://redis:6379/0"
+    DATABASE_URL: str = (
+        "postgresql://aeroserve:aeroserve_password@postgres:5432/aeroserve_logs"
+    )
+
+    # Priority Queue (Platform-wide weights)
+    BASE_WEIGHTS: dict[str, int] = Field(
+        default_factory=lambda: {
+            "premium": 5,
+            "standard": 3,
+            "background": 1,
+        }
+    )
+
+    # Dynamic Batching Fallbacks
+    DEFAULT_MAX_BATCH_SIZE: int = 16
+    DEFAULT_BATCH_TIMEOUT_MS: int = 50
+
+    # Circuit Breaker & Health Monitoring
+    HEARTBEAT_INTERVAL_SEC: float = 1.0
+    HEARTBEAT_TTL_SEC: int = 3
+    CB_FAILURE_THRESHOLD: int = 2
+    CB_CONSECUTIVE_SUCCESS_THRESHOLD: int = 3
+
+    # Autoscaler Settings
+    SCALE_UP_COOLDOWN_SEC: int = 30
+    SCALE_DOWN_COOLDOWN_SEC: int = 120
+    SCALE_DOWN_HYSTERESIS_FACTOR: float = 0.5
+    MAX_WORKERS: int = 8
+    MIN_WORKERS: int = 1
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+
+settings = Settings()
+
+
+================================================
+FILE: docker
+================================================
+[Empty file]
+
+
+================================================
+FILE: docker-compose.yml
+================================================
+services:
+  api-gateway:
+    build:
+      context: .
+      dockerfile: ./gateway/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://aeroserve:${POSTGRES_PASSWORD:-aeroserve_password}@postgres:5432/aeroserve_logs
+      - ENVIRONMENT=production
+    volumes:
+      - ./models:/app/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2-alpine
+    # Exposing ports removed for production isolation. Internal services reach redis:6379 directly.
+    # ports:
+    #   - "127.0.0.1:6379:6379"  # Use loopback only if debugging locally outside docker
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aeroserve}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aeroserve_password}
+      POSTGRES_DB: ${POSTGRES_DB:-aeroserve_logs}
+    # No public port binding; accessible only on internal compose network
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aeroserve} -d ${POSTGRES_DB:-aeroserve_logs}"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://aeroserve:${POSTGRES_PASSWORD:-aeroserve_password}@postgres:5432/aeroserve_logs
+    volumes:
+      - ./models:/app/models
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: always
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: ./scheduler/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    # Port 8001 remains internal to docker network; Prometheus scrapes it at http://scheduler:8001
+    volumes:
+      - ./models:/app/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  autoscaler:
+    build:
+      context: .
+      dockerfile: ./autoscaler/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./models:/app/models:ro
+      - ./docker-compose.yml:/app/docker-compose.yml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    # Scrapes scheduler and gateway internally
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    depends_on:
+      - scheduler
+      - api-gateway
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  postgres_data:
+  grafana_data:
+
+
+================================================
+FILE: load_test.py
+================================================
+import requests
+import concurrent.futures
+import time
+
+def send_request(i):
+    try:
+        res = requests.post(
+            "http://localhost:8000/predict",
+            json={
+                "model_name": "iris_model",
+                "priority": "standard",
+                "user_tier": "user",
+                "payload": {"features": [5.1, 3.5, 1.4, 0.2]}
+            }
+        )
+        return res.status_code
+    except Exception as e:
+        return str(e)
+
+if __name__ == "__main__":
+    start_time = time.time()
+    print("Firing 250 concurrent requests...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        results = list(executor.map(send_request, range(250)))
+    print(f"Finished in {time.time() - start_time:.2f} seconds.")
+
+
+================================================
+FILE: load_test2.py
+================================================
+import asyncio
+import aiohttp
+import time
+
+URL = "http://localhost:8000/predict"
+PAYLOAD = {
+    "model_name": "iris_model",
+    "priority": "standard",
+    "user_tier": "user",
+    "payload": {"features": [5.1, 3.5, 1.4, 0.2]}
+}
+DURATION_SECONDS = 40
+
+async def send_requests(session):
+    requests_sent = 0
+    end_time = time.time() + DURATION_SECONDS
+    while time.time() < end_time:
+        try:
+            async with session.post(URL, json=PAYLOAD) as response:
+                await response.read()
+                requests_sent += 1
+        except Exception:
+            pass
+    return requests_sent
+
+async def main():
+    print(f"ðŸš€ Firing asynchronous blast for {DURATION_SECONDS} seconds...")
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=500)) as session:
+        tasks = [send_requests(session) for _ in range(200)]
+        results = await asyncio.gather(*tasks)
+    print(f"âœ… Fired {sum(results)} requests!")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+================================================
+FILE: prometheus.yml
+================================================
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Scrape Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Scrape the Health-Aware Scheduler (Queue Depth & Age)
+  - job_name: 'aeroserve_scheduler'
+    static_configs:
+      # Matches the docker-compose service name and the port we exposed
+      - targets: ['scheduler:8001']
+
+  # Scrape the API Gateway (Arrival Rate & p95 Latency)
+  - job_name: 'aeroserve_gateway'
+    static_configs:
+      # Assuming your gateway service is named 'api-gateway' or 'gateway'
+      # We will instrument this next!
+      - targets: ['api-gateway:8000']
+
+  - job_name: 'aeroserve_workers'
+    static_configs:
+      - targets: ['worker:8002']    
+
+
+================================================
+FILE: pyproject.toml
+================================================
+[tool.ruff.lint]
+# B008: Allow Depends() in FastAPI routes
+# BLE001: Allow catching broad Exceptions for health checks
+extend-ignore = ["B008", "BLE001"]
+
+
+================================================
+FILE: autoscaler/Dockerfile
+================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install build dependencies if needed
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    docker.io \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY autoscaler/requirements.txt /app/requirements.txt
+RUN pip install --default-timeout=1000 -r requirements.txt
+COPY config.py /app/config.py
+COPY autoscaler/ /app/autoscaler/
+
+ENV PYTHONPATH=/app
+
+CMD ["python", "-u", "autoscaler/main.py"]
+
+
+================================================
+FILE: autoscaler/main.py
+================================================
+import os
+import sys
+import time
+import math
+import logging
+import subprocess
+import requests
+import json
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, PROJECT_ROOT)
+
+from config import settings
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [Autoscaler]: %(message)s")
+logger = logging.getLogger("AeroServe.Autoscaler")
+
+PROMETHEUS_URL = "http://prometheus:9090"
+POLL_INTERVAL_SEC = 5
+
+def get_dynamic_scaling_limits():
+    """Scans all model_config.json files for zero-touch scaling limits."""
+    base_min_workers = 1
+    aggregate_max_workers = 1
+    avg_target_queue = 15
+    
+    models_dir = os.path.join(PROJECT_ROOT, "models")
+    if not os.path.exists(models_dir):
+        return base_min_workers, aggregate_max_workers, avg_target_queue
+        
+    targets = []
+    for folder in os.listdir(models_dir):
+        if folder.startswith(".tmp_"): continue
+        
+        config_path = os.path.join(models_dir, folder, "model_config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                    autoscaling = config.get("autoscaling", {})
+                    
+                    m_max = autoscaling.get("max_workers", 1)
+                    if m_max > aggregate_max_workers:
+                        aggregate_max_workers = m_max
+                        
+                    targets.append(autoscaling.get("target_queue_per_worker", 15))
+            except Exception as e:
+                logger.error(f"Failed to read scaling config from {folder}: {e}")
+                
+    if targets:
+        avg_target_queue = sum(targets) // len(targets)
+        
+    return base_min_workers, aggregate_max_workers, avg_target_queue
+
+class QueueAutoscaler:
+    def __init__(self):
+        self.min_w, self.max_w, self.target_q = get_dynamic_scaling_limits()
+        self.current_workers = self.min_w
+        self.last_scale_time = 0.0
+
+    def query_prometheus(self, query: str) -> float:
+        try:
+            response = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=3)
+            response.raise_for_status()
+            results = response.json().get("data", {}).get("result", [])
+            if results:
+                return float(results[0]["value"][1])
+            return 0.0
+        except Exception:
+            return 0.0
+
+    def execute_scale(self, target_workers: int, action: str):
+        logger.info(f"Action: {action} | Scaling workers from {self.current_workers} -> {target_workers}")
+        try:
+            subprocess.run(
+                ["docker", "compose", "up", "-d", "--scale", f"worker={target_workers}"],
+                capture_output=True, text=True, check=True, cwd=PROJECT_ROOT 
+            )
+            self.current_workers = target_workers
+            self.last_scale_time = time.time()
+            logger.info(f"Scale successful. New worker count: {target_workers}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Scale command failed! STDERR: {e.stderr}")
+
+    def evaluate(self):
+        now = time.time()
+        time_since_last_scale = now - self.last_scale_time
+
+        self.min_w, self.max_w, self.target_q = get_dynamic_scaling_limits()
+
+        total_queue_depth = self.query_prometheus("sum(aeroserve_queue_depth)")
+        oldest_age = self.query_prometheus("max(aeroserve_oldest_request_age_seconds)")
+
+        depth_desired = math.ceil(total_queue_depth / self.target_q) if self.target_q > 0 else self.min_w
+        
+        age_desired = 0
+        if oldest_age > 2.0: 
+            age_desired = self.current_workers + 1
+            
+        raw_desired = max(depth_desired, age_desired)
+        desired_workers = max(self.min_w, min(raw_desired, self.max_w))
+
+        # FIX: Using the uppercase configuration settings
+        if desired_workers > self.current_workers:
+            if time_since_last_scale >= settings.SCALE_UP_COOLDOWN_SEC:
+                logger.info("UPWARD PRESSURE DETECTED.")
+                self.execute_scale(desired_workers, "SCALE UP")
+            else:
+                cooldown_left = settings.SCALE_UP_COOLDOWN_SEC - time_since_last_scale
+                logger.info(f"Scale up in cooldown ({cooldown_left:.0f}s left)")
+
+        elif desired_workers < self.current_workers:
+            current_capacity = self.current_workers * self.target_q
+            hysteresis_threshold = current_capacity * settings.SCALE_DOWN_HYSTERESIS_FACTOR
+
+            if total_queue_depth < hysteresis_threshold and oldest_age == 0:
+                if time_since_last_scale >= settings.SCALE_DOWN_COOLDOWN_SEC:
+                    logger.info("DOWNWARD PRESSURE DETECTED.")
+                    self.execute_scale(desired_workers, "SCALE DOWN")
+                else:
+                    cooldown_left = settings.SCALE_DOWN_COOLDOWN_SEC - time_since_last_scale
+                    logger.info(f"Scale down in cooldown ({cooldown_left:.0f}s left)")
+
+    def run(self):
+        logger.info("AeroServe Queue-Driven Autoscaler Started.")
+        while True:
+            self.evaluate()
+            time.sleep(POLL_INTERVAL_SEC)
+
+if __name__ == "__main__":
+    autoscaler = QueueAutoscaler()
+    try:
+        autoscaler.run()
+    except KeyboardInterrupt:
+        logger.info("Autoscaler shut down by user.")
+
+
+================================================
+FILE: autoscaler/requirements.txt
+================================================
+requests
+docker>=7.0.0
+redis>=5.0.0
+pydantic-settings>=2.0.0
+requests>=2.31.0
+prometheus-client>=0.19.0
+
+
+================================================
+FILE: gateway/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: gateway/Dockerfile
+================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY gateway/requirements.txt ./requirements.txt
+RUN pip install --default-timeout=1000 -r requirements.txt
+COPY gateway/ ./gateway/
+COPY config.py ./config.py
+
+ENV PYTHONPATH=/app
+
+CMD ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--backlog", "2048"]
+
+
+
+================================================
+FILE: gateway/main.py
+================================================
+import asyncio
+import json
+import os
+import time
+import uuid
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+
+import redis.asyncio as redis
+import asyncpg
+from fastapi import Depends, FastAPI, HTTPException, Request, status, BackgroundTasks
+from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Counter, Gauge, Histogram
+
+from config import settings
+from gateway.schemas import HealthResponse, PredictRequest, PredictResponse
+
+# --- Prometheus Metrics ---
+AEROSERVE_QUEUE_DEPTH = Gauge("aeroserve_queue_depth", "Current depth of the priority queues", ["priority"])
+AEROSERVE_REQUEST_COUNT = Counter("aeroserve_requests_total", "Total inference requests received", ["priority", "model_name"])
+AEROSERVE_OLDEST_AGE = Gauge("aeroserve_oldest_request_age_seconds", "Age of the oldest request", ["priority"])
+
+AEROSERVE_LATENCY = Histogram(
+    "aeroserve_request_latency_seconds", 
+    "End-to-end latency", 
+    ["priority"],
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0, 60.0)
+)
+AEROSERVE_INFERENCE_STATUS = Counter("aeroserve_inference_status_total", "Outcome of inference requests", ["priority", "status"])
+AEROSERVE_IN_FLIGHT = Gauge("aeroserve_in_flight_requests", "Requests currently being processed", ["priority"])
+AEROSERVE_DB_WRITES = Counter("aeroserve_db_writes_total", "Postgres write success/fail", ["status"])
+
+KNOWN_PRIORITIES = ["premium", "standard", "background"]
+
+# --- DYNAMIC MODEL REGISTRY ---
+ENABLE_CHAOS_MODE = os.getenv("ENABLE_CHAOS_MODE", "True").lower() == "true"
+MODELS_DIR = os.getenv("MODELS_DIR", "/app/models")  # Changed to /app/models to match Docker
+model_registry = {}
+
+def load_model_registry():
+    """Reloads the models in memory so zero-touch updates are recognized"""
+    if not os.path.exists(MODELS_DIR):
+        print(f"[Gateway] Warning: Models directory '{MODELS_DIR}' not found.")
+        return
+    
+    current_models = {}
+    for model_folder in os.listdir(MODELS_DIR):
+        # Skip temporary folders created by the CLI during atomic swap
+        if model_folder.startswith(".tmp_"):
+            continue
+            
+        config_path = os.path.join(MODELS_DIR, model_folder, "model_config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                    model_name = config["model_name"]
+                    current_models[model_name] = config
+                    print(f"[Gateway] Registered Model: {model_name}")
+            except Exception as e:
+                print(f"[Gateway] Failed to load config for {model_folder}: {e}")
+                
+    # Update global registry atomically
+    global model_registry
+    model_registry = current_models
+
+async def update_prometheus_metrics(redis_client: redis.Redis):
+    while True:
+        try:
+            # Periodically reload models to support the CLI zero-touch deployment
+            load_model_registry()
+            
+            for priority in KNOWN_PRIORITIES:
+                queue_name = f"queue:{priority}"
+                depth = await redis_client.llen(queue_name)
+                AEROSERVE_QUEUE_DEPTH.labels(priority=priority).set(depth)
+                
+                if depth > 0:
+                    oldest_req_bytes = await redis_client.lrange(queue_name, 0, 0)
+                    if oldest_req_bytes:
+                        req_data = json.loads(oldest_req_bytes[0])
+                        created_at = req_data.get("created_at", time.time())
+                        AEROSERVE_OLDEST_AGE.labels(priority=priority).set(time.time() - created_at)
+                else:
+                    AEROSERVE_OLDEST_AGE.labels(priority=priority).set(0.0)
+        except Exception as e:
+            print(f"[Gateway] Metrics/Registry error: {e}")
+        await asyncio.sleep(2)
+
+# --- POSTGRES LOGGING ---
+async def log_request_to_db(pool, req_id: str, model: str, priority: str, req_status: str, result: dict | None, latency: float):
+    # Upsert query handles both the initial "pending" log and the final "success/error" update
+    query = """
+        INSERT INTO inference_logs (request_id, model_name, priority, status, inference_result, latency_ms)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (request_id) 
+        DO UPDATE SET 
+            status = EXCLUDED.status, 
+            inference_result = EXCLUDED.inference_result, 
+            latency_ms = EXCLUDED.latency_ms
+    """
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(query, req_id, model, priority, req_status, json.dumps(result) if result else None, latency)
+        AEROSERVE_DB_WRITES.labels(status="success").inc()
+    except Exception as e:
+        AEROSERVE_DB_WRITES.labels(status="error").inc()
+        print(f"[Gateway] DB Logging Error for {req_id}: {e}")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator:
+    load_model_registry()
+    
+    app.state.redis_pool = redis.ConnectionPool.from_url(settings.REDIS_URL, max_connections=500, decode_responses=True)
+    app.state.redis = redis.Redis(connection_pool=app.state.redis_pool)
+    
+    app.state.db_pool = await asyncpg.create_pool(settings.DATABASE_URL, min_size=5, max_size=20)
+    try:
+        async with app.state.db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS inference_logs (
+                    request_id UUID PRIMARY KEY,
+                    model_name VARCHAR(255) NOT NULL,
+                    priority VARCHAR(50) NOT NULL,
+                    status VARCHAR(50) NOT NULL,
+                    inference_result JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    latency_ms REAL
+                );
+            """)
+        print("[Gateway] PostgreSQL inference_logs table is ready.")
+    except Exception as e:
+        print(f"[Gateway] Table creation safely skipped: {e}")
+        
+    metrics_task = asyncio.create_task(update_prometheus_metrics(app.state.redis))
+    yield
+    
+    metrics_task.cancel()
+    await app.state.redis.aclose()
+    await app.state.redis_pool.disconnect()
+    await app.state.db_pool.close()
+
+app = FastAPI(title=settings.PROJECT_NAME, version="1.0.0", lifespan=lifespan)
+Instrumentator().instrument(app).expose(app)
+
+def get_redis_client(request: Request) -> redis.Redis:
+    return request.app.state.redis
+
+@app.post("/chaos/crash", tags=["Chaos Engineering"], status_code=status.HTTP_202_ACCEPTED)
+async def trigger_chaos(queue_name: str = "standard", model: str = "resnet50_classifier", redis_client: redis.Redis = Depends(get_redis_client)):
+    if not ENABLE_CHAOS_MODE:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chaos Engineering mode disabled.")
+    
+    request_id = f"chaos-{uuid.uuid4().hex[:8]}"
+    envelope = {
+        "request_id": request_id,
+        "model_name": model,
+        "created_at": time.time(),
+        "priority": queue_name,
+        "payload": {"image_data": "POISON_PILL"} 
+    }
+    try:
+        await redis_client.rpush(f"queue:{queue_name}", json.dumps(envelope))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Chaos injection failed: {exc}")
+    return {"status": "Poison pill injected", "request_id": request_id}
+
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+async def health_check(redis_client: redis.Redis = Depends(get_redis_client)):
+    try:
+        redis_ok = await redis_client.ping()
+    except Exception:
+        redis_ok = False
+    
+    # FIX: Expose loaded models so the CLI deployment verification works
+    loaded_models = list(model_registry.keys())
+    return HealthResponse(
+        status="healthy" if redis_ok else "degraded", 
+        redis_connected=redis_ok,
+        models_loaded=loaded_models
+    )
+
+@app.post("/predict", response_model=PredictResponse, tags=["Inference Routing"])
+async def predict(
+    request_data: PredictRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    redis_client: redis.Redis = Depends(get_redis_client)
+):
+    model_name = request_data.model_name
+    
+    # FIX: Prevent phantom requests. Act as a strict bouncer.
+    if model_name not in model_registry:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found or not loaded.")
+
+    priority_val = getattr(request_data.priority, 'value', request_data.priority)
+    queue_name = f"queue:{priority_val}"
+    
+    slas = model_registry[model_name].get("slas", {})
+    dynamic_timeout = slas.get("priority_timeouts_s", {}).get(priority_val, slas.get("max_queue_wait_s", 45.0))
+
+    request_id = str(uuid.uuid4())
+    timestamp = time.time()
+    
+    envelope = {
+        "request_id": request_id,
+        "model_name": model_name,
+        "created_at": timestamp,                    
+        "priority": priority_val,
+        "user_tier": getattr(request_data.user_tier, 'value', request_data.user_tier),
+        "payload": request_data.payload.model_dump() # Pass the dict, not the Pydantic object
+    }
+    
+    pubsub = redis_client.pubsub()
+    response_channel = f"response:{request_id}"
+    await pubsub.subscribe(response_channel)
+    
+    # FIX: Ensure no requests are lost to DB if queue crashes
+    background_tasks.add_task(log_request_to_db, request.app.state.db_pool, request_id, model_name, priority_val, "pending", None, 0.0)
+    
+    AEROSERVE_IN_FLIGHT.labels(priority=priority_val).inc()
+    
+    try:
+        try:
+            await redis_client.rpush(queue_name, json.dumps(envelope))
+            AEROSERVE_REQUEST_COUNT.labels(priority=priority_val, model_name=model_name).inc()
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="Queue backend unavailable.")
+            
+        try:
+            async with asyncio.timeout(dynamic_timeout): 
+                async for message in pubsub.listen():
+                    if message["type"] == "message":
+                        result = json.loads(message["data"])
+                        latency_s = time.time() - timestamp
+                        latency_ms = latency_s * 1000
+                        
+                        AEROSERVE_LATENCY.labels(priority=priority_val).observe(latency_s)
+                        
+                        if result.get("status") == "error":
+                            AEROSERVE_INFERENCE_STATUS.labels(priority=priority_val, status="worker_error").inc()
+                            background_tasks.add_task(log_request_to_db, request.app.state.db_pool, request_id, model_name, priority_val, "error", {"error": result.get("error")}, latency_ms)
+                            raise HTTPException(status_code=500, detail=result.get("error"))
+                        
+                        AEROSERVE_INFERENCE_STATUS.labels(priority=priority_val, status="success").inc()
+                        background_tasks.add_task(log_request_to_db, request.app.state.db_pool, request_id, model_name, priority_val, "success", result.get("data"), latency_ms)
+                        
+                        return PredictResponse(
+                            request_id=request_id,
+                            status="completed",
+                            queue=queue_name,
+                            timestamp=timestamp,
+                            inference_result=result.get("data")
+                        )
+        except asyncio.TimeoutError:
+            latency_s = time.time() - timestamp
+            latency_ms = latency_s * 1000
+            AEROSERVE_LATENCY.labels(priority=priority_val).observe(latency_s)
+            AEROSERVE_INFERENCE_STATUS.labels(priority=priority_val, status="timeout").inc()
+            
+            background_tasks.add_task(log_request_to_db, request.app.state.db_pool, request_id, model_name, priority_val, "timeout", None, latency_ms)
+            raise HTTPException(status_code=504, detail=f"Worker timeout for SLA: {dynamic_timeout}s")
+        finally:
+            await pubsub.unsubscribe(response_channel)
+            await pubsub.close() 
+    finally:
+        AEROSERVE_IN_FLIGHT.labels(priority=priority_val).dec()
+
+
+================================================
+FILE: gateway/requirements.txt
+================================================
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+pydantic>=2.6.0
+redis[hiredis]>=5.0.0
+httpx>=0.27.0
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+ruff>=0.3.0
+pydantic-settings>=2.0.0
+prometheus-fastapi-instrumentator==7.0.0
+gunicorn==21.2.0
+asyncpg
+
+
+================================================
+FILE: gateway/schemas.py
+================================================
+import enum
+import base64
+from typing import Any
+from pydantic import BaseModel, Field, field_validator,model_validator
+
+class PriorityTier(str, enum.Enum):
+    PREMIUM = "premium"
+    STANDARD = "standard"
+    BACKGROUND = "background"
+
+class UserTier(str, enum.Enum):
+    ADMIN = "admin"
+    USER = "user"
+    GUEST = "guest"
+
+class InferencePayload(BaseModel):
+    text: str | None = Field(default=None, description="Raw text string for NLP models")
+    image_b64: str | None = Field(default=None, description="Base64 encoded image string for Computer Vision")
+    features: list[float] | None = Field(default=None, description="1D array of numerical features for tabular models")
+    tensors: list[Any] | None = Field(default=None, description="Multi-dimensional array structures for raw tensor input")
+
+    @field_validator('image_b64')
+    @classmethod
+    def validate_image_b64(cls, v: str | None) -> str | None:
+        if v is not None:
+            try:
+                # Validate it is actually a decodable base64 string
+                base64.b64decode(v, validate=True)
+            except Exception:
+                raise ValueError("image_b64 must be a valid base64 encoded string")
+        return v
+
+    @model_validator(mode='after')
+    def check_at_least_one_input(self):
+        if not any([self.text, self.image_b64 is not None, self.features, self.tensors]):
+            raise ValueError("Payload must contain at least one input type (text, image_b64, features, or tensors).")
+        return self
+
+class PredictRequest(BaseModel):
+    model_name: str = Field(..., description="Target model identifier registered in AeroServe")
+    payload: InferencePayload = Field(..., description="Strictly typed input data payload")
+    priority: PriorityTier = Field(
+        default=PriorityTier.STANDARD, 
+        description="Inference priority tier: premium, standard, or background"
+    )
+    user_tier: UserTier = Field(
+        default=UserTier.GUEST,
+        description="Access tier of the requesting user"
+    )
+
+class PredictResponse(BaseModel):
+    request_id: str = Field(..., description="Correlation ID for end-to-end tracing")
+    status: str = Field(default="enqueued", description="Lifecycle status of the request")
+    queue: str = Field(..., description="Target Redis queue where the job is stored")
+    timestamp: float = Field(..., description="UNIX timestamp when the request was ingested")
+    inference_result: dict[str, Any] | None = Field(default=None, description="The final prediction output from the worker")
+
+class HealthResponse(BaseModel):
+    status: str
+    redis_connected: bool
+    models_loaded: list[str] = Field(default_factory=list, description="List of actively registered models")
+
+
+================================================
+FILE: gateway/tests/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: gateway/tests/test_health.py
+================================================
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from gateway.main import app, lifespan
+
+
+@pytest.fixture
+def anyio_backend():
+    """Required for pytest.mark.anyio to know which async backend to use."""
+    return "asyncio"
+
+@pytest.mark.anyio
+async def test_health_check():
+    # Explicitly trigger the lifespan to initialize app.state.redis
+    
+        async with lifespan(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/health")
+            assert response.status_code == 200
+            assert "status" in response.json()
+
+
+================================================
+FILE: gateway/tests/test_predict.py
+================================================
+import json
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from gateway.main import app, lifespan
+
+
+@pytest.fixture
+def anyio_backend():
+    """Required for pytest.mark.anyio to know which async backend to use."""
+    return "asyncio"
+
+@pytest.fixture
+async def async_client():
+    """Initializes the AsyncClient and natively triggers the Redis lifespan."""
+    
+    async with lifespan(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            yield client
+
+@pytest.mark.anyio
+async def test_health_check_endpoint(async_client):
+    """Unit: Health check returns service status and connection states."""
+    response = await async_client.get("/health")
+    assert response.status_code == 200
+    assert "redis_connected" in response.json()
+
+@pytest.mark.anyio
+async def test_predict_classification_and_validation(async_client):
+    """Unit: Request validation and default priority tier handling."""
+    resp = await async_client.post(
+        "/predict",
+        json={"model_name": "isic-classifier", "payload": {"image_b64": "test_data"}}
+    )
+    assert resp.status_code == 202
+    assert resp.json()["queue"] == "standard"
+
+    resp_premium = await async_client.post(
+        "/predict",
+        json={
+            "model_name": "isic-classifier", 
+            "payload": {"image_b64": "test_data"},
+            "priority": "premium"
+        }
+    )
+    assert resp_premium.status_code == 202
+    assert resp_premium.json()["queue"] == "premium"
+
+    resp_invalid = await async_client.post(
+        "/predict",
+        json={
+            "model_name": "isic-classifier", 
+            "payload": {"image_b64": "test_data"},
+            "priority": "ultra-fast"
+        }
+    )
+    assert resp_invalid.status_code == 422
+
+@pytest.mark.anyio
+async def test_gateway_to_redis_integration(async_client):
+    """Integration: Full route test proving item lands with correct shape in Redis."""
+    target_queue = "background"
+    
+    # Because the lifespan is active, app.state.redis is fully accessible
+    redis_client = app.state.redis
+    
+    await redis_client.delete(target_queue)
+    
+    test_payload = {"features": [1.0, 2.5, 3.8]}
+    response = await async_client.post(
+        "/predict",
+        json={
+            "model_name": "tabular-nn",
+            "payload": test_payload,
+            "priority": target_queue
+        }
+    )
+    assert response.status_code == 202
+    assigned_id = response.json()["request_id"]
+    
+    raw_item = await redis_client.rpop(target_queue)
+    assert raw_item is not None
+    
+    enqueued_data = json.loads(raw_item)
+    assert enqueued_data["request_id"] == assigned_id
+    assert enqueued_data["priority"] == "background"
+    assert enqueued_data["model_name"] == "tabular-nn"
+
+
+================================================
+FILE: models/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: models/aeroserve_preprocessor.py
+================================================
+from abc import ABC, abstractmethod
+from typing import Any
+
+
+class AeroServeProcessor(ABC):
+    """
+    Base interface for all AeroServe processors.
+
+    Every processor must implement execute(), which accepts
+    a validated inference payload and returns a dictionary
+    containing the inference result.
+    """
+
+    @abstractmethod
+    def execute(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Execute inference and return a JSON-serializable dictionary."""
+        raise NotImplementedError
+
+
+class AeroServeManagedProcessor(AeroServeProcessor):
+    """
+    Framework-managed inference pipeline.
+
+    AeroServe controls the execution sequence:
+        preprocess -> predict -> postprocess
+
+    Developers implement the three individual stages.
+    """
+
+    @abstractmethod
+    def preprocess(self, payload: dict[str, Any]) -> Any:
+        """Transform the validated payload into tensors, arrays, or model inputs."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def predict(self, model_input: Any) -> Any:
+        """Execute the model's forward pass."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def postprocess(self, inference_output: Any) -> dict[str, Any]:
+        """Convert model outputs into a JSON-serializable dictionary."""
+        raise NotImplementedError
+
+    def execute(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Run the complete managed inference pipeline."""
+        features = self.preprocess(payload)
+        raw_output = self.predict(features)
+        result = self.postprocess(raw_output)
+
+        if not isinstance(result, dict):
+            raise TypeError(
+                "postprocess() must return a dictionary."
+            )
+
+        return result
+
+
+class AeroServeCustomProcessor(AeroServeProcessor):
+    """
+    Developer-managed inference pipeline.
+
+    Developers implement execute() themselves when their
+    inference workflow requires custom orchestration.
+    """
+
+    @abstractmethod
+    def execute(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Execute the full inference cycle and return a result dictionary."""
+        raise NotImplementedError
+
+
+
+
+================================================
+FILE: models/iris_model/iris_pipeline.joblib
+================================================
+[Binary file]
+
+
+================================================
+FILE: models/iris_model/model_config.json
+================================================
+{
+    "model_name": "iris_model",
+    "version": "1.0.0",
+    "framework": "custom",
+    "processor": {
+        "file": "processor.py",
+        "class_name": "IrisProcessor"
+    },
+    "batching": {
+        "max_batch_size": 64,
+        "batch_timeout_ms": 15
+    },
+    "slas": {
+        "expected_inference_ms": 17,
+        "max_queue_wait_s": 10.0,
+        "priority_timeouts_s": {
+            "premium": 3.0,
+            "standard": 10.0,
+            "background": 30.0
+        }
+    },
+    "autoscaling": {
+        "min_workers": 1,
+        "max_workers": 84,
+        "target_queue_per_worker": 128
+    }
+}
+
+
+================================================
+FILE: models/iris_model/processor.py
+================================================
+import os
+import joblib
+import numpy as np
+import time
+from typing import Any, Dict, List
+
+# Import the base class expected by AeroServe
+from models.aeroserve_preprocessor import AeroServeProcessor
+
+class IrisProcessor(AeroServeProcessor):
+    # Enable AeroServe's dynamic batching engine
+    supports_batching = True
+
+    def __init__(self):
+        # Resolve path dynamically so it works inside the Docker worker volume
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        artifact_path = os.path.join(current_dir, "iris_pipeline.joblib")
+        
+        print(f"Loading Iris Model and Scaler from {artifact_path}...")
+        artifacts = joblib.load(artifact_path)
+        self.model = artifacts['model']
+        self.scaler = artifacts['scaler']
+
+    def execute(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Handles a single inference request."""
+        features = payload.get("features")
+        
+        if not features or len(features) != 4:
+            return {"status": "error", "error": "Payload must contain a 'features' array of exactly 4 numeric values."}
+        
+        # Reshape for sklearn (1 sample, 4 features)
+        X = np.array([features])
+        X_scaled = self.scaler.transform(X)
+        prediction = self.model.predict(X_scaled)[0]
+        
+        return {"status": "success", "prediction": str(prediction)}
+
+    def execute_batch(self, payloads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Handles dynamically batched requests for high throughput."""
+        time.sleep(10)
+        X_list = []
+        valid_indices = []
+        
+        # Initialize default error responses
+        results = [{"status": "error", "error": "Invalid features array"} for _ in payloads]
+        
+        for idx, p in enumerate(payloads):
+            feats = p.get("features")
+            if feats and len(feats) == 4:
+                X_list.append(feats)
+                valid_indices.append(idx)
+        
+        # Perform vectorized inference on valid payloads
+        if X_list:
+            X_array = np.array(X_list)
+            X_scaled = self.scaler.transform(X_array)
+            predictions = self.model.predict(X_scaled)
+            
+            # Map predictions back to their original positions in the batch
+            for i, pred_val in enumerate(predictions):
+                original_idx = valid_indices[i]
+                results[original_idx] = {"status": "success", "prediction": str(pred_val)}
+                
+        return results
+
+
+================================================
+FILE: models/iris_model/test_inputs.json
+================================================
+[
+    {
+        "features": [5.1, 3.5, 1.4, 0.2]
+    },
+    {
+        "features": [6.7, 3.0, 5.2, 2.3]
+    },
+    {
+        "features": [5.9, 3.0, 5.1, 1.8]
+    },
+    {
+        "features": [4.9, 3.0, 1.4, 0.2]
+    }
+]
+
+
+================================================
+FILE: scheduler/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: scheduler/Dockerfile
+================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY scheduler/requirements.txt .
+RUN pip install --default-timeout=1000 --no-cache-dir -r requirements.txt
+
+COPY scheduler/ ./scheduler/
+COPY config.py .
+
+ENV PYTHONPATH=/app
+CMD ["python", "-u", "scheduler/main.py"]
+
+
+================================================
+FILE: scheduler/main.py
+================================================
+import asyncio
+import json
+import time
+import logging
+from prometheus_client import start_http_server, Gauge
+import redis.asyncio as redis_async
+
+from config import settings
+from scheduler.state_machine import WorkerCircuitBreaker, CircuitBreakerConfig, WorkerState
+from scheduler.rerouter import RequestRerouter
+
+logger = logging.getLogger("AeroServe.Scheduler")
+
+QUEUE_DEPTH = Gauge('aeroserve_queue_depth', 'Current requests in queue', ['priority'])
+OLDEST_AGE = Gauge('aeroserve_oldest_request_age_seconds', 'Age of oldest request', ['priority'])
+AEROSERVE_TARGET_WORKERS = Gauge("aeroserve_target_workers", "Number of worker replicas requested by the autoscaler")
+
+async def metrics_publisher_loop(redis_client: redis_async.Redis):
+    queues = ["premium", "standard", "background"]
+    logger.info("Metrics publisher loop started on port 8001")
+    
+    while True:
+        try:
+            for q_name in queues:
+                queue_key = f"queue:{q_name}"
+                depth = await redis_client.llen(queue_key)
+                QUEUE_DEPTH.labels(priority=q_name).set(depth)
+                
+                if depth > 0:
+                    oldest_raw = await redis_client.lindex(queue_key, -1)
+                    if oldest_raw:
+                        task = json.loads(oldest_raw)
+                        age = time.time() - task["created_at"]
+                        OLDEST_AGE.labels(priority=q_name).set(age)
+                else:
+                    OLDEST_AGE.labels(priority=q_name).set(0)
+                    
+        except Exception as e:
+            logger.error(f"Error publishing metrics: {e}")
+            
+        await asyncio.sleep(2)
+
+async def health_check_loop(redis_client: redis_async.Redis, cb: WorkerCircuitBreaker, rerouter: RequestRerouter):
+    """FIX: The missing engine. Actively scans heartbeats and triggers failover."""
+    logger.info("Worker Health Monitor started.")
+    
+    while True:
+        try:
+            # Get all workers that registered themselves
+            workers = await redis_client.smembers("registered_workers")
+            
+            for w_id in workers:
+                is_alive = await redis_client.exists(f"worker:heartbeat:{w_id}")
+                
+                if not is_alive:
+                    # Heartbeat missing! Record failure in the circuit breaker
+                    new_state = await cb.record_heartbeat_failure(w_id)
+                    
+                    if new_state == WorkerState.UNHEALTHY:
+                        logger.warning(f"Worker {w_id} isolated. Rerouting orphaned tasks...")
+                        await rerouter.recover_orphaned_requests(w_id)
+                        
+                        # Remove from active registry so we don't endlessly reroute
+                        await redis_client.srem("registered_workers", w_id)
+                else:
+                    # Heartbeat active, record success
+                    await cb.record_heartbeat_success(w_id)
+                    
+        except Exception as e:
+            logger.error(f"Health monitor error: {e}")
+            
+        await asyncio.sleep(settings.HEARTBEAT_INTERVAL_SEC)
+
+async def main():
+    start_http_server(8001)
+    redis_client = redis_async.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    
+    config = CircuitBreakerConfig(
+        failure_threshold=settings.CB_FAILURE_THRESHOLD,
+        consecutive_success_threshold=settings.CB_CONSECUTIVE_SUCCESS_THRESHOLD
+    )
+    cb = WorkerCircuitBreaker(redis_client, config)
+    rerouter = RequestRerouter(redis_client)
+    
+    metrics_task = asyncio.create_task(metrics_publisher_loop(redis_client))
+    health_task = asyncio.create_task(health_check_loop(redis_client, cb, rerouter))
+    
+    logger.info("Scheduler started successfully.")
+    
+    await asyncio.gather(metrics_task, health_task)
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
+
+
+================================================
+FILE: scheduler/requirements.txt
+================================================
+prometheus-client==0.20.0
+redis>=5.0.0
+pydantic-settings>=2.0.0
+
+
+
+================================================
+FILE: scheduler/rerouter.py
+================================================
+import json
+import logging
+from typing import List, Dict, Any
+from redis.asyncio import Redis
+
+logger = logging.getLogger("AeroServe.Scheduler.Rerouter")
+
+
+class RequestRerouter:
+    """Detects requests assigned to dead/unhealthy workers and requeues them safely."""
+
+    def __init__(self, redis: Redis):
+        self.redis = redis
+
+    def _processing_queue(self, worker_id: str) -> str:
+        return f"queue:processing:{worker_id}"
+
+    async def recover_orphaned_requests(self, dead_worker_id: str) -> int:
+        processing_queue = self._processing_queue(dead_worker_id)
+        requeued_count = 0
+
+        while True:
+            # Atomic fetch from dead worker's processing queue
+            raw_payload = await self.redis.rpop(processing_queue)
+            if not raw_payload:
+                break
+
+            payload_str = raw_payload.decode("utf-8") if isinstance(raw_payload, bytes) else raw_payload
+            try:
+                request_data: Dict[str, Any] = json.loads(payload_str)
+            except json.JSONDecodeError:
+                logger.error(f"Malformed payload dropped during recovery: {payload_str}")
+                continue
+
+            priority = request_data.get("priority", "standard").lower()
+            target_queue = f"queue:{priority}"
+
+            # Re-enqueue at the front (LPUSH) so orphaned requests retain priority
+            request_data["requeued"] = True
+            await self.redis.lpush(target_queue, json.dumps(request_data))
+            requeued_count += 1
+
+        if requeued_count > 0:
+            logger.warning(
+                f"Recovered and requeued {requeued_count} orphaned request(s) from worker {dead_worker_id}."
+            )
+        return requeued_count
+
+
+================================================
+FILE: scheduler/state_machine.py
+================================================
+import enum
+import time
+from typing import Optional
+from redis.asyncio import Redis
+
+
+class WorkerState(str, enum.Enum):
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+    DRAINING = "draining"
+
+
+class CircuitBreakerConfig:
+    def __init__(
+        self,
+        heartbeat_ttl_sec: int = 5,
+        consecutive_success_threshold: int = 3,
+        failure_threshold: int = 2,
+    ):
+        self.heartbeat_ttl_sec = heartbeat_ttl_sec
+        self.consecutive_success_threshold = consecutive_success_threshold
+        self.failure_threshold = failure_threshold
+
+
+class WorkerCircuitBreaker:
+    """Manages the lifecycle and state transitions of individual workers in Redis."""
+
+    def __init__(self, redis: Redis, config: Optional[CircuitBreakerConfig] = None):
+        self.redis = redis
+        self.config = config or CircuitBreakerConfig()
+
+    def _state_key(self, worker_id: str) -> str:
+        return f"worker:{worker_id}:state"
+
+    def _heartbeat_key(self, worker_id: str) -> str:
+        return f"worker:heartbeat:{worker_id}"
+
+    def _success_counter_key(self, worker_id: str) -> str:
+        return f"worker:{worker_id}:consecutive_success"
+
+    def _failure_counter_key(self, worker_id: str) -> str:
+        return f"worker:{worker_id}:consecutive_failures"
+
+    async def get_state(self, worker_id: str) -> WorkerState:
+        raw = await self.redis.get(self._state_key(worker_id))
+        if raw is None:
+            return WorkerState.HEALTHY
+        decoded = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        return WorkerState(decoded)
+
+    async def set_state(self, worker_id: str, new_state: WorkerState) -> None:
+        await self.redis.set(self._state_key(worker_id), new_state.value)
+        if new_state == WorkerState.HEALTHY:
+            await self.redis.sadd("active_workers:healthy", worker_id)
+            await self.redis.srem("active_workers:unhealthy", worker_id)
+            await self.redis.srem("active_workers:draining", worker_id)
+        elif new_state == WorkerState.UNHEALTHY:
+            await self.redis.srem("active_workers:healthy", worker_id)
+            await self.redis.sadd("active_workers:unhealthy", worker_id)
+            await self.redis.srem("active_workers:draining", worker_id)
+        elif new_state == WorkerState.DRAINING:
+            await self.redis.srem("active_workers:healthy", worker_id)
+            await self.redis.srem("active_workers:unhealthy", worker_id)
+            await self.redis.sadd("active_workers:draining", worker_id)
+
+    async def register_worker(self, worker_id: str) -> None:
+        await self.redis.sadd("registered_workers", worker_id)
+        await self.set_state(worker_id, WorkerState.HEALTHY)
+
+    async def record_heartbeat_failure(self, worker_id: str) -> WorkerState:
+        failures = await self.redis.incr(self._failure_counter_key(worker_id))
+        await self.redis.delete(self._success_counter_key(worker_id))
+
+        current_state = await self.get_state(worker_id)
+        if failures >= self.config.failure_threshold and current_state != WorkerState.UNHEALTHY:
+            await self.set_state(worker_id, WorkerState.UNHEALTHY)
+            return WorkerState.UNHEALTHY
+        return current_state
+
+    async def record_heartbeat_success(self, worker_id: str) -> WorkerState:
+        await self.redis.delete(self._failure_counter_key(worker_id))
+        current_state = await self.get_state(worker_id)
+
+        if current_state == WorkerState.UNHEALTHY:
+            successes = await self.redis.incr(self._success_counter_key(worker_id))
+            if successes >= self.config.consecutive_success_threshold:
+                await self.set_state(worker_id, WorkerState.HEALTHY)
+                await self.redis.delete(self._success_counter_key(worker_id))
+                return WorkerState.HEALTHY
+            else:
+                await self.set_state(worker_id, WorkerState.DRAINING)
+                return WorkerState.DRAINING
+
+        elif current_state == WorkerState.DRAINING:
+            successes = await self.redis.incr(self._success_counter_key(worker_id))
+            if successes >= self.config.consecutive_success_threshold:
+                await self.set_state(worker_id, WorkerState.HEALTHY)
+                await self.redis.delete(self._success_counter_key(worker_id))
+                return WorkerState.HEALTHY
+            return WorkerState.DRAINING
+
+        return WorkerState.HEALTHY
+
+
+================================================
+FILE: tests/conftest.py
+================================================
+import pytest
+import pytest_asyncio
+import fakeredis.aioredis
+
+@pytest_asyncio.fixture
+async def redis():
+    """Provides a fresh in-memory Redis instance for each test."""
+    server = fakeredis.FakeServer()
+    client = fakeredis.aioredis.FakeRedis(server=server, decode_responses=False)
+    yield client
+    await client.flushall()
+    await client.aclose()
+
+
+================================================
+FILE: tests/e2e/test_autoscaling.py
+================================================
+import asyncio
+import httpx
+import time
+import logging
+import uuid
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("AeroServe.LoadTest")
+
+GATEWAY_URL = "http://localhost:8000/predict"
+TOTAL_REQUESTS = 100
+
+async def fire_request(client: httpx.AsyncClient, req_id: int):
+    """Fires a single inference request."""
+    payload = {
+        # 1. UPDATED to hit the zero-touch registry
+        "model_name": "resnet50_classifier", 
+        "priority": "premium",
+        "payload": {
+            "image_data": f"mock_base64_data_{req_id}"
+        }
+    }
+    try:
+        # 2. UPDATED timeout to 60.0 to survive autoscaler cold starts
+        response = await client.post(GATEWAY_URL, json=payload, timeout=60.0)
+        if response.status_code == 200:
+            logger.debug(f"Request {req_id} succeeded.")
+        else:
+            logger.warning(f"Request {req_id} failed: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Request {req_id} error: {e}")
+
+async def run_load_test():
+    logger.info(f"Initiating Load Test: Firing {TOTAL_REQUESTS} requests...")
+    start_time = time.time()
+    
+    async with httpx.AsyncClient(limits=httpx.Limits(max_connections=200)) as client:
+        tasks = []
+        for i in range(TOTAL_REQUESTS):
+            tasks.append(fire_request(client, i))
+            # ADD THIS: A tiny stagger to prevent local TCP socket exhaustion
+            
+        await asyncio.gather(*tasks)
+        
+    elapsed = time.time() - start_time
+    logger.info(f"Load Test Complete! Sent {TOTAL_REQUESTS} requests in {elapsed:.2f} seconds.")
+
+if __name__ == "__main__":
+    asyncio.run(run_load_test())
+
+
+================================================
+FILE: tests/e2e/test_live_resilience.py
+================================================
+import asyncio
+import httpx
+import subprocess
+import time
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("AeroServe.E2E")
+
+# Update these to match your local setup
+GATEWAY_URL = "http://localhost:8000/predict"  # Your FastAPI endpoint
+WORKER_CONTAINER_NAME = "aeroserve-worker-1"   # Check `docker ps` for the exact name
+
+async def trigger_prediction(client: httpx.AsyncClient, request_id: str):
+    """Sends a prediction request and waits for the response."""
+    
+    # UPDATED PAYLOAD: Matches the FastAPI PredictRequest schema exactly
+    payload = {
+        "model_name": "test_cnn_model", 
+        "priority": "premium",
+        "payload": {
+            "image_data": "base64_encoded_image_string_here"
+        }
+    }
+    
+    start_time = time.time()
+    logger.info(f"Sending request {request_id} to Gateway...")
+    
+    try:
+        response = await client.post(GATEWAY_URL, json=payload, timeout=15.0)
+        elapsed = time.time() - start_time
+        
+        assert response.status_code == 200, f"Gateway returned {response.status_code}: {response.text}"
+        logger.info(f"SUCCESS: Request {request_id} completed in {elapsed:.2f}s despite worker death!")
+        return True
+    except httpx.ReadTimeout:
+        logger.error(f"FAIL: Request {request_id} timed out. The request was dropped or gateway hung.")
+        return False
+    except Exception as e:
+        logger.error(f"FAIL: Request {request_id} resulted in error: {e}")
+        return False
+
+async def kill_worker_container():
+    """Simulates a catastrophic container failure mid-batch."""
+    # Wait briefly to ensure the request has hit the worker's processing queue
+    await asyncio.sleep(0.5) 
+    logger.warning(f"Executing Chaos: Killing container {WORKER_CONTAINER_NAME}...")
+    
+    # Subprocess calls the host's Docker daemon to forcefully kill the container
+    process = subprocess.run(
+        ["docker", "kill", WORKER_CONTAINER_NAME], 
+        capture_output=True, 
+        text=True
+    )
+    
+    if process.returncode == 0:
+        logger.warning(f"Container {WORKER_CONTAINER_NAME} successfully killed.")
+    else:
+        logger.error(f"Failed to kill container: {process.stderr}")
+
+async def run_e2e_resilience_test():
+    """Runs the E2E test flow."""
+    logger.info("Starting Live E2E Resilience Test...")
+    
+    async with httpx.AsyncClient() as client:
+        # Fire the HTTP request and the container kill command concurrently
+        results = await asyncio.gather(
+            trigger_prediction(client, "req-e2e-chaos-1"),
+            kill_worker_container()
+        )
+        
+        request_success = results[0]
+        if request_success:
+            logger.info("E2E Test Passed: The scheduler successfully rescued and rerouted the task.")
+        else:
+            logger.error("E2E Test Failed: The system dropped the task.")
+
+if __name__ == "__main__":
+    asyncio.run(run_e2e_resilience_test())
+
+
+================================================
+FILE: tests/unit/test_scheduler_rerouter.py
+================================================
+import json
+import pytest
+from scheduler.rerouter import RequestRerouter
+
+@pytest.mark.asyncio
+async def test_recover_orphaned_requests(redis):
+    rerouter = RequestRerouter(redis)
+    dead_worker_id = "worker-dead-1"
+    
+    # Simulate tasks trapped in a dead worker's processing queue
+    tasks = [
+        {"request_id": "req-1", "priority": "premium"},
+        {"request_id": "req-2", "priority": "standard"}
+    ]
+    for task in tasks:
+        await redis.lpush(f"queue:processing:{dead_worker_id}", json.dumps(task))
+        
+    recovered_count = await rerouter.recover_orphaned_requests(dead_worker_id)
+    
+    assert recovered_count == 2
+    assert await redis.llen(f"queue:processing:{dead_worker_id}") == 0
+    assert await redis.llen("queue:premium") == 1
+    assert await redis.llen("queue:standard") == 1
+    
+    # Verify LPUSH maintained priority at the front of the queue
+    premium_task = json.loads(await redis.rpop("queue:premium"))
+    assert premium_task["requeued"] is True
+
+
+================================================
+FILE: tests/unit/test_scheduler_state_machine.py
+================================================
+import pytest
+from scheduler.state_machine import WorkerCircuitBreaker, CircuitBreakerConfig, WorkerState
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_transitions(redis):
+    config = CircuitBreakerConfig(failure_threshold=2, consecutive_success_threshold=2)
+    cb = WorkerCircuitBreaker(redis, config)
+    worker_id = "worker-cb-1"
+    
+    await cb.register_worker(worker_id)
+    assert await cb.get_state(worker_id) == WorkerState.HEALTHY
+    
+    # 1st failure - should remain healthy
+    await cb.record_heartbeat_failure(worker_id)
+    assert await cb.get_state(worker_id) == WorkerState.HEALTHY
+    
+    # 2nd failure - threshold reached, should trip to unhealthy
+    await cb.record_heartbeat_failure(worker_id)
+    assert await cb.get_state(worker_id) == WorkerState.UNHEALTHY
+    
+    # 1st success - should transition to draining/half-open
+    await cb.record_heartbeat_success(worker_id)
+    assert await cb.get_state(worker_id) == WorkerState.DRAINING
+    
+    # 2nd success - should fully restore to healthy
+    await cb.record_heartbeat_success(worker_id)
+    assert await cb.get_state(worker_id) == WorkerState.HEALTHY
+
+
+================================================
+FILE: tests/unit/test_worker_fetcher.py
+================================================
+import json
+import pytest
+from worker.main import ReliableTaskFetcher
+
+@pytest.mark.asyncio
+async def test_reliable_task_fetcher_atomic_move(redis):
+    worker_id = "worker-fetch-1"
+    fetcher = ReliableTaskFetcher(redis, worker_id)
+    
+    # Seed a task in the premium queue
+    task_payload = {"request_id": "req-1", "priority": "premium", "created_at": 1000}
+    await redis.lpush("queue:premium", json.dumps(task_payload))
+    
+    # Fetch task
+    task = await fetcher.fetch_task("queue:premium")
+    assert task is not None
+    assert task.request_id == "req-1"
+    
+    # Verify it was removed from premium and added to processing
+    assert await redis.llen("queue:premium") == 0
+    assert await redis.llen(fetcher.processing_queue) == 1
+    
+    # Complete task
+    await fetcher.complete_task(task.raw_data)
+    assert await redis.llen(fetcher.processing_queue) == 0
+
+
+================================================
+FILE: tests/unit/test_worker_heartbeat.py
+================================================
+import asyncio
+import pytest
+from worker.heartbeat import HeartbeatEmitter
+
+@pytest.mark.asyncio
+async def test_heartbeat_emitter_lifecycle(redis):
+    worker_id = "worker-test-1"
+    emitter = HeartbeatEmitter(redis, worker_id, heartbeat_interval_sec=0.1, ttl_sec=2)
+    
+    # Start heartbeat coroutine
+    await emitter.start()
+    await asyncio.sleep(0.15) # Wait for first pulse
+    
+    # Check registration and pulse
+    is_registered = await redis.sismember("registered_workers", worker_id)
+    assert is_registered
+    
+    pulse_exists = await redis.exists(f"worker:heartbeat:{worker_id}")
+    assert pulse_exists == 1
+    
+    # Stop and verify it exits cleanly
+    await emitter.stop()
+    assert emitter.is_running is False
+
+
+================================================
+FILE: tests/unit/test_worker_kill_recovery.py
+================================================
+import asyncio
+import json
+import pytest
+from scheduler.state_machine import WorkerCircuitBreaker, CircuitBreakerConfig, WorkerState
+from scheduler.rerouter import RequestRerouter
+
+@pytest.mark.asyncio
+async def test_end_to_end_worker_crash_and_recovery(redis):
+    """
+    Simulates:
+    1. A worker pulling a task.
+    2. The worker container crashing (heartbeats stop, task stuck in processing).
+    3. The scheduler detecting the crash, isolating the worker, and rerouting the task.
+    """
+    worker_id = "worker-doomed-container"
+    
+    # Setup Scheduler Components
+    config = CircuitBreakerConfig(failure_threshold=1) # Fast fail for test
+    cb = WorkerCircuitBreaker(redis, config)
+    rerouter = RequestRerouter(redis)
+    
+    # 1. Register the worker (Simulate startup)
+    await cb.register_worker(worker_id)
+    await redis.set(f"worker:heartbeat:{worker_id}", "1", ex=2)
+    
+    # 2. Simulate worker fetching a Premium task mid-batch
+    in_flight_task = {"request_id": "req-vip-1", "priority": "premium"}
+    await redis.lpush(f"queue:processing:{worker_id}", json.dumps(in_flight_task))
+    
+    # Verify initial healthy state
+    assert await cb.get_state(worker_id) == WorkerState.HEALTHY
+    assert await redis.llen(f"queue:processing:{worker_id}") == 1
+    
+    # 3. THE CRASH: Simulate time passing and heartbeat expiring
+    await redis.delete(f"worker:heartbeat:{worker_id}")
+    
+    # 4. The Scheduler runs its cycle
+    heartbeat_exists = await redis.exists(f"worker:heartbeat:{worker_id}")
+    
+    if not heartbeat_exists:
+        # Scheduler logs a failure
+        new_state = await cb.record_heartbeat_failure(worker_id)
+        
+        # Scheduler isolates the worker and reroutes
+        if new_state == WorkerState.UNHEALTHY:
+            await rerouter.recover_orphaned_requests(worker_id)
+            
+    # 5. Verify the Recovery
+    # The worker must be isolated
+    assert await cb.get_state(worker_id) == WorkerState.UNHEALTHY
+    
+    # The processing queue must be cleared
+    assert await redis.llen(f"queue:processing:{worker_id}") == 0
+    
+    # The task must not be dropped; it must be back in the Premium queue
+    assert await redis.llen("queue:premium") == 1
+    recovered_task = json.loads(await redis.rpop("queue:premium"))
+    assert recovered_task["request_id"] == "req-vip-1"
+    assert recovered_task["requeued"] is True
+
+
+================================================
+FILE: tools/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: tools/profiler.py
+================================================
+import argparse
+import importlib.util
+import inspect
+import json
+import os
+import sys
+import time
+import psutil
+from typing import Tuple, Type, List, Dict, Any
+
+# Ensure the worker can find the base classes in the root directory
+sys.path.insert(0, os.path.abspath("."))
+from models.aeroserve_preprocessor import AeroServeProcessor
+
+
+def load_processor_class(model_dir: str, file_name: str = "processor.py", target_class_name: str = None) -> Tuple[Type[AeroServeProcessor], str, str]:
+    """Dynamically imports the developer's processor class."""
+    target_path = os.path.join(model_dir, file_name)
+    if not os.path.isfile(target_path):
+        raise FileNotFoundError(f"Missing processor implementation at {target_path}")
+    
+    spec = importlib.util.spec_from_file_location("dynamic_module", target_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module specification from {target_path}")
+    
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    
+    matched_classes = []
+    for name, obj in inspect.getmembers(module, inspect.isclass):
+        if issubclass(obj, AeroServeProcessor) and not inspect.isabstract(obj):
+            if target_class_name and name == target_class_name:
+                return obj, file_name, name
+            matched_classes.append((name, obj))
+            
+    if not matched_classes:
+        for name, obj in inspect.getmembers(module, inspect.isclass):
+            if hasattr(obj, "execute") and obj.__module__ == "dynamic_module" and not inspect.isabstract(obj):
+                if target_class_name and name == target_class_name:
+                    return obj, file_name, name
+                matched_classes.append((name, obj))
+                
+    if target_class_name:
+        raise TypeError(f"Class '{target_class_name}' not found in {file_name}")
+        
+    if not matched_classes:
+        raise TypeError(f"No valid concrete subclass of AeroServeProcessor found in {file_name}")
+        
+    name, selected_class = matched_classes[0]
+    return selected_class, file_name, name
+
+def get_process_memory_mb() -> float:
+    """Reads physical RAM or GPU VRAM usage."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return float(torch.cuda.memory_allocated() / (1024 * 1024))
+    except ImportError:
+        pass
+    process = psutil.Process(os.getpid())
+    return float(process.memory_info().rss / (1024 * 1024))
+
+def run_profiling(
+    model_name: str,
+    source_dir: str,
+    framework: str,
+    sla_target_ms: float | None,
+    test_inputs: List[Dict[str, Any]],
+    output_dir: str,
+    target_class_name: str = None
+) -> Dict[str, Any]:
+    print(f"[*] Profiling model: {model_name}")
+    print(f"[*] Reading artifacts from: {source_dir}")
+    
+    # Pass the target_class_name down to the loader
+    ProcessorCls, proc_file, proc_class_name = load_processor_class(source_dir, target_class_name=target_class_name)
+    
+    print(f"[*] Instantiating processor class '{proc_class_name}'...")
+    instance = ProcessorCls()
+    
+
+    # Step A: Validate functional output and establish baseline minimum latency
+    initial_payload = test_inputs[0]
+    
+    warmup_start = time.perf_counter()
+    test_run_output = instance.execute(initial_payload)
+    baseline_latency_ms = (time.perf_counter() - warmup_start) * 1000.0
+    
+    print(f"[+] Functional verification succeeded. Sample output: {test_run_output}")
+    print(f"[+] Absolute minimum hardware latency (Batch 1): {baseline_latency_ms:.2f} ms")
+
+    # Step A.1: Auto-calculate SLA if the developer omitted it
+    if sla_target_ms is None or sla_target_ms <= 0:
+        sla_target_ms = max(50.0, baseline_latency_ms * 3.0) 
+        print(f"[*] No SLA provided. Auto-configured SLA Target to: {sla_target_ms:.0f} ms")
+
+    # Step B: Read available system constraints
+    system_memory_mb = psutil.virtual_memory().total / (1024 * 1024)
+    memory_ceiling_mb = system_memory_mb * 0.80
+
+    # Step C: Batch ladder sweep
+    batch_ladder = [1, 2, 4, 8, 16, 32, 64]
+    benchmark_results: Dict[int, Dict[str, float]] = {}
+    chosen_batch_size = 1
+
+    print("\n--- Empirical Benchmark Matrix ---")
+    print(f"{'Batch Size':<12}{'Latency (ms)':<16}{'Memory (MB)':<14}{'Status'}")
+
+    for b_size in batch_ladder:
+        payloads = [test_inputs[i % len(test_inputs)] for i in range(b_size)]
+        
+        start_clock = time.perf_counter()
+        for p in payloads:
+            instance.execute(p)
+        latency_duration_ms = (time.perf_counter() - start_clock) * 1000.0
+
+        current_mem_mb = get_process_memory_mb()
+        benchmark_results[b_size] = {"latency": latency_duration_ms, "memory": current_mem_mb}
+
+        breached_sla = latency_duration_ms > sla_target_ms
+        breached_mem = current_mem_mb > (memory_ceiling_mb / 2.0)
+
+        status_str = "OK"
+        if breached_sla:
+            status_str = f"EXCEEDED_SLA (>{sla_target_ms:.0f}ms)"
+        elif breached_mem:
+            status_str = "EXCEEDED_MEMORY_BUDGET"
+
+        print(f"{b_size:<12}{latency_duration_ms:<16.2f}{current_mem_mb:<14.1f}{status_str}")
+
+        if breached_sla or breached_mem:
+            break
+        chosen_batch_size = b_size
+
+    # Step D: Derive SLAs and Auto-scaling limits based on optimal batch
+    optimal_stats = benchmark_results[chosen_batch_size]
+    measured_latency_ms = max(1, int(optimal_stats["latency"]))
+    measured_memory_mb = max(150.0, optimal_stats["memory"])
+
+    max_concurrent_workers = max(1, int(memory_ceiling_mb / measured_memory_mb))
+
+    base_seconds = measured_latency_ms / 1000.0
+    sla_premium_s = max(3.0, round(base_seconds * 10.0, 1))
+    sla_standard_s = max(10.0, round(base_seconds * 30.0, 1))
+    sla_background_s = max(30.0, round(base_seconds * 100.0, 1))
+    
+    # Calculate the timeout for the dual-trigger batcher in the worker
+    dynamic_batch_timeout_ms = max(15, int(measured_latency_ms / 2))
+
+    config_data = {
+        "model_name": model_name,
+        "version": "1.0.0",
+        "framework": framework,
+        "processor": {
+            "file": proc_file,
+            "class_name": proc_class_name
+        },
+        "batching": {
+            "max_batch_size": chosen_batch_size,
+            "batch_timeout_ms": dynamic_batch_timeout_ms
+        },
+        "slas": {
+            "expected_inference_ms": measured_latency_ms,
+            "max_queue_wait_s": sla_standard_s,
+            "priority_timeouts_s": {
+                "premium": sla_premium_s,
+                "standard": sla_standard_s,
+                "background": sla_background_s
+            }
+        },
+        "autoscaling": {
+            "min_workers": 1,
+            "max_workers": max_concurrent_workers,
+            "target_queue_per_worker": max(4, chosen_batch_size * 2)
+        }
+    }
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_file = os.path.join(output_dir, "model_config.json")
+    with open(out_file, "w") as f:
+        json.dump(config_data, f, indent=4)
+
+    print(f"\n[+] Production model configuration written to: {out_file}")
+    return config_data
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="AeroServe Empirical ML Profiler")
+    parser.add_argument("--model", type=str, required=True, help="Target model identifier")
+    parser.add_argument("--model-dir", type=str, required=True, help="Directory containing processor.py and test_inputs.json")
+    parser.add_argument("--framework", type=str, default="transformers", choices=["transformers", "pytorch", "tensorflow", "onnx", "custom"])
+    # Note: SLA is now completely optional. If omitted, the profiler auto-detects it.
+    parser.add_argument("--sla", type=float, default=None, help="Max acceptable latency in ms (Optional: Auto-calculated if omitted)")
+    
+    args = parser.parse_args()
+    
+    # Standardize input path
+    inputs_path = os.path.join(args.model_dir, "test_inputs.json")
+    if not os.path.isfile(inputs_path):
+        print(f"[-] Missing test inputs: {inputs_path}")
+        sys.exit(1)
+        
+    with open(inputs_path, "r") as f:
+        try:
+            test_records = json.load(f)
+            if not isinstance(test_records, list) or len(test_records) == 0:
+                raise ValueError("Must contain a non-empty JSON array")
+        except Exception as e:
+            print(f"[-] Invalid test_inputs.json format: {e}")
+            sys.exit(1)
+
+    run_profiling(
+        model_name=args.model,
+        source_dir=args.model_dir,
+        framework=args.framework,
+        sla_target_ms=args.sla,
+        test_inputs=test_records,
+        output_dir=args.model_dir
+    )
+
+
+================================================
+FILE: worker/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: worker/Dockerfile
+================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies required for psutil and ML frameworks
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY worker/requirements.txt .
+RUN pip install --default-timeout=3000 --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --default-timeout=3000 --no-cache-dir -r requirements.txt
+# Copy the necessary files
+COPY worker/ ./worker/
+COPY config.py .
+
+ENV PYTHONPATH=/app
+CMD ["python", "-u", "worker/main.py"]
+
+
+================================================
+FILE: worker/heartbeat.py
+================================================
+import asyncio
+import logging
+from redis.asyncio import Redis
+
+logger = logging.getLogger("AeroServe.Worker.Heartbeat")
+
+class HeartbeatEmitter:
+    """Runs as a lightweight background coroutine inside the worker container."""
+
+    def __init__(self, redis: Redis, worker_id: str, heartbeat_interval_sec: float = 2.0, ttl_sec: int = 5):
+        self.redis = redis
+        self.worker_id = worker_id
+        self.interval = heartbeat_interval_sec
+        self.ttl = ttl_sec
+        self.is_running = False
+        self._task: asyncio.Task = None
+
+    async def start(self):
+        self.is_running = True
+        await self.redis.sadd("registered_workers", self.worker_id)
+        self._task = asyncio.create_task(self._pulse_loop())
+
+    async def _pulse_loop(self):
+        heartbeat_key = f"worker:heartbeat:{self.worker_id}"
+        while self.is_running:
+            try:
+                await self.redis.set(heartbeat_key, "1", ex=self.ttl)
+            except Exception as e:
+                logger.error(f"Failed to publish heartbeat: {e}")
+            await asyncio.sleep(self.interval)
+
+    async def stop(self):
+        self.is_running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        # FIX: Clean up registry on graceful shutdown
+        try:
+            await self.redis.srem("registered_workers", self.worker_id)
+            await self.redis.delete(f"worker:heartbeat:{self.worker_id}")
+        except Exception:
+            pass
+
+
+================================================
+FILE: worker/main.py
+================================================
+import asyncio
+import json
+import logging
+import signal
+import time
+import uuid
+import os
+import sys
+import importlib.util
+from collections import deque, defaultdict
+from enum import Enum  
+
+sys.path.insert(0, "/app")
+
+from config import settings
+from worker.heartbeat import HeartbeatEmitter
+from prometheus_client import start_http_server, Gauge, Counter, Histogram
+
+WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
+
+# --- PROMETHEUS METRICS ---
+CB_STATE = Gauge("aeroserve_circuit_state", "Circuit Breaker State", ["worker_id"])
+INFERENCE_TIME = Histogram("aeroserve_inference_time_ms", "Time taken for inference in ms", ["worker_id", "model_name"])
+REQUEUED_TASKS = Counter("aeroserve_requeued_tasks_total", "Number of tasks requeued", ["worker_id"])
+AEROSERVE_BATCH_SIZE = Histogram("aeroserve_batch_size", "Number of items in a batch", buckets=(1, 2, 4, 8, 16, 32, 64))
+AEROSERVE_BATCH_TRIGGER = Counter("aeroserve_batch_trigger_total", "Batch trigger reason", ["worker_id", "reason"])
+AEROSERVE_BATCH_WAIT_TIME = Histogram("aeroserve_batch_wait_time_seconds", "Time first request waited in buffer", buckets=(0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 5.0))
+
+CB_STATE.labels(worker_id=WORKER_ID).set(0)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [AeroServe.Worker]: %(message)s")
+logger = logging.getLogger("AeroServe.Worker")
+
+class CircuitState(Enum):
+    CLOSED = "CLOSED"       
+    OPEN = "OPEN"           
+    HALF_OPEN = "HALF_OPEN" 
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = settings.CB_FAILURE_THRESHOLD, recovery_timeout: float = 30.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.state = CircuitState.CLOSED
+        self.failure_count = 0
+        self.last_failure_time = 0.0
+
+    def set_state(self, new_state: CircuitState):
+        self.state = new_state
+        state_map = {CircuitState.CLOSED: 0, CircuitState.HALF_OPEN: 1, CircuitState.OPEN: 2}
+        CB_STATE.labels(worker_id=WORKER_ID).set(state_map[new_state])
+
+    def can_execute(self) -> bool:
+        if self.state == CircuitState.CLOSED: return True
+        if self.state == CircuitState.OPEN:
+            if time.time() - self.last_failure_time >= self.recovery_timeout:
+                logger.warning("Circuit Breaker entering HALF_OPEN state.")
+                self.set_state(CircuitState.HALF_OPEN)
+                return True
+            return False
+        return True
+
+    def record_success(self):
+        if self.state != CircuitState.CLOSED:
+            logger.info("Worker recovered completely.")
+        self.set_state(CircuitState.CLOSED)
+        self.failure_count = 0
+
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.state == CircuitState.HALF_OPEN:
+            self.set_state(CircuitState.OPEN)
+        elif self.state == CircuitState.CLOSED and self.failure_count >= self.failure_threshold:
+            logger.error(f"Circuit Breaker TRIPPED to OPEN after {self.failure_count} crashes!")
+            self.set_state(CircuitState.OPEN)
+
+class DynamicModelRegistry:
+    def __init__(self, models_dir="/app/models"):
+        self.models_dir = models_dir
+        self.processors = {}
+        self.configs = {} 
+        self.load_all_processors()
+
+    def load_model(self, model_name: str) -> bool:
+        """FIX: Dynamically load a specific model on-demand (Zero-Touch support)"""
+        folder_path = os.path.join(self.models_dir, model_name)
+        config_path = os.path.join(folder_path, "model_config.json")
+        if not os.path.exists(config_path):
+            return False
+            
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            self.configs[model_name] = config 
+            
+            proc_info = config.get("processor")
+            if proc_info:
+                file_path = os.path.join(folder_path, proc_info["file"])
+                class_name = proc_info["class_name"]
+                spec = importlib.util.spec_from_file_location(class_name, file_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                ProcessorClass = getattr(module, class_name)
+                self.processors[model_name] = ProcessorClass()
+                logger.info(f"Zero-Touch: Dynamically loaded model {model_name} into VRAM.")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to dynamically load {model_name}: {e}")
+        return False
+
+    def load_all_processors(self):
+        if not os.path.exists(self.models_dir): return
+        for folder in os.listdir(self.models_dir):
+            if not folder.startswith(".tmp_"):
+                self.load_model(folder)
+
+    def run_inference(self, requests: list) -> list[dict]:
+        if not requests: return []
+        model_name = requests[0].model_name
+        
+        # FIX: On-demand loading
+        if model_name not in self.processors:
+            success = self.load_model(model_name)
+            if not success:
+                return [{"status": "error", "error": f"Model {model_name} not found"} for _ in requests]
+                
+        processor = self.processors[model_name]
+        has_batch_support = getattr(processor, "supports_batching", False)
+        
+        # FIX: True vectorized execution
+        try:
+            if has_batch_support:
+                payloads = [req.payload for req in requests]
+                return processor.execute_batch(payloads)
+            else:
+                # Fallback for models that explicitly don't support batching
+                results = []
+                for req in requests:
+                    results.append(processor.execute(req.payload))
+                return results
+        except Exception as e:
+            logger.error(f"Inference crash on {model_name}: {e}")
+            raise
+
+class InferenceRequest:
+    def __init__(self, raw_data: str, parsed_data: dict, registry: DynamicModelRegistry):
+        self.request_id = parsed_data["request_id"]
+        self.model_name = parsed_data.get("model_name", "dummy_model")
+        self.priority = parsed_data["priority"]
+        self.created_at = parsed_data["created_at"]
+        self.payload = parsed_data.get("payload")
+        self.raw_data = raw_data  
+        
+        model_config = registry.configs.get(self.model_name, {})
+        slas = model_config.get("slas", {}).get("priority_timeouts_s", {})
+        sla_timeout = slas.get(self.priority, 1.0) 
+        self.deadline = self.created_at + sla_timeout
+
+class Batch:
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self.requests: list[InferenceRequest] = []
+        self.flush_reason = None
+        self.batch_start_time = time.time()  # FIX: Track actual batch formation time
+
+class ReliableTaskFetcher:
+    def __init__(self, redis, worker_id: str, registry: DynamicModelRegistry):
+        self.redis = redis
+        self.worker_id = worker_id
+        self.processing_queue = f"queue:processing:{self.worker_id}"
+        self.registry = registry
+
+    async def fetch_task(self, source_queue: str) -> InferenceRequest | None:
+        try:
+            raw_payload = await self.redis.lmove(source_queue, self.processing_queue, "RIGHT", "LEFT")
+            if not raw_payload: return None
+            payload_str = raw_payload.decode("utf-8") if isinstance(raw_payload, bytes) else raw_payload
+            return InferenceRequest(raw_data=payload_str, parsed_data=json.loads(payload_str), registry=self.registry)
+        except Exception as e:
+            return None
+
+    async def complete_task(self, raw_data_str: str) -> None:
+        await self.redis.lrem(self.processing_queue, 1, raw_data_str)
+
+    async def requeue_task(self, req: InferenceRequest) -> None:
+        try:
+            await self.redis.lpush(f"queue:{req.priority}", req.raw_data)
+            await self.complete_task(req.raw_data)
+            REQUEUED_TASKS.labels(worker_id=self.worker_id).inc() 
+        except Exception:
+            pass
+
+class WRRScheduler:
+    def __init__(self, redis_client, fetcher: ReliableTaskFetcher):
+        self.redis = redis_client
+        self.fetcher = fetcher
+
+    async def calculate_effective_weights(self) -> dict[str, int]:
+        weights = settings.BASE_WEIGHTS.copy()
+        current_time = time.time()
+        pipe = self.redis.pipeline()
+        pipe.lrange("queue:standard", -1, -1)
+        pipe.lrange("queue:background", -1, -1)
+        std_oldest, bg_oldest = await pipe.execute()
+        
+        if std_oldest:
+            if current_time - json.loads(std_oldest[0])["created_at"] > 0.1:
+                weights["standard"] = 5
+        if bg_oldest:
+            wait_time = current_time - json.loads(bg_oldest[0])["created_at"]
+            if wait_time > 30.0: weights["background"] = 3
+            if wait_time > 60.0: weights["background"] = 5
+        return weights
+
+    async def fetch_wrr(self) -> list[InferenceRequest]:
+        weights = await self.calculate_effective_weights()
+        fetched = []
+        for queue_name, count in weights.items():
+            for _ in range(count):
+                task = await self.fetcher.fetch_task(f"queue:{queue_name}")
+                if task: fetched.append(task)
+                else: break 
+        return fetched
+
+class BatchBuilder:
+    def __init__(self, scheduler: WRRScheduler, registry: DynamicModelRegistry):
+        self.scheduler = scheduler
+        self.registry = registry
+        # FIX: Bucket requests by model to prevent Head-of-Line blocking
+        self.model_buffers = defaultdict(list)
+        self.active_batches = {}
+
+    async def build_next_batch(self, shutdown_event: asyncio.Event) -> Batch | None:
+        while not shutdown_event.is_set():
+            # 1. Fetch new tasks and bucket them by model
+            fetched = await self.scheduler.fetch_wrr()
+            for req in fetched:
+                self.model_buffers[req.model_name].append(req)
+                if req.model_name not in self.active_batches:
+                    self.active_batches[req.model_name] = Batch(req.model_name)
+
+            now = time.time()
+
+            # 2. Check all active batches for flush conditions
+            for model_name, batch in list(self.active_batches.items()):
+                buffer = self.model_buffers[model_name]
+                
+                model_config = self.registry.configs.get(model_name, {})
+                max_batch_size = model_config.get("batching", {}).get("max_batch_size", settings.DEFAULT_MAX_BATCH_SIZE)
+                batch_timeout_ms = model_config.get("batching", {}).get("batch_timeout_ms", settings.DEFAULT_BATCH_TIMEOUT_MS)
+
+                # Move items from buffer to batch
+                while buffer and len(batch.requests) < max_batch_size:
+                    batch.requests.append(buffer.pop(0))
+                
+                if not batch.requests:
+                    del self.active_batches[model_name]
+                    continue
+
+                # Trigger 1: Max Size
+                if len(batch.requests) >= max_batch_size:
+                    batch.flush_reason = "MAX_SIZE"
+                    del self.active_batches[model_name]
+                    return batch
+
+                # Trigger 2: SLA Deadline Danger
+                earliest_deadline = min(req.deadline for req in batch.requests)
+                if (earliest_deadline - now) <= 0.05: # Give 50ms buffer to execute
+                    batch.flush_reason = "EARLIEST_DEADLINE"
+                    del self.active_batches[model_name]
+                    return batch
+                
+                # Trigger 3: Batch Timeout (FIXED: Measured from batch creation, not ingestion)
+                if (now - batch.batch_start_time) * 1000 >= batch_timeout_ms:
+                    batch.flush_reason = "BATCH_TIMEOUT"
+                    del self.active_batches[model_name]
+                    return batch
+
+            try:
+                await asyncio.sleep(0.01) 
+            except asyncio.CancelledError:
+                break
+                
+        # Flush everything on shutdown
+        for model_name, batch in self.active_batches.items():
+            if batch.requests:
+                batch.flush_reason = "SHUTDOWN"
+                return batch
+        return None
+
+class InferenceWorker:
+    def __init__(self, processor_registry, redis_client, fetcher: ReliableTaskFetcher):
+        self.processor_registry = processor_registry
+        self.redis = redis_client
+        self.fetcher = fetcher
+        self.circuit_breaker = CircuitBreaker() 
+
+    def log_metrics(self, batch: Batch, inference_ms: float):
+        counts = {"premium": 0, "standard": 0, "background": 0}
+        wait_time_s = 0.0
+        
+        for req in batch.requests:
+            counts[req.priority] += 1
+            
+        AEROSERVE_BATCH_SIZE.observe(len(batch.requests))
+        if batch.flush_reason:
+            AEROSERVE_BATCH_TRIGGER.labels(worker_id=WORKER_ID, reason=batch.flush_reason.lower()).inc()
+            
+        if batch.requests:
+            wait_time_s = time.time() - min(req.created_at for req in batch.requests)
+            AEROSERVE_BATCH_WAIT_TIME.observe(wait_time_s)
+
+        INFERENCE_TIME.labels(worker_id=WORKER_ID, model_name=batch.model_name).observe(inference_ms)
+        logger.info(f"Batch flushed [{batch.model_name}] | Reason: {batch.flush_reason} | Size: {len(batch.requests)} | P:{counts['premium']} S:{counts['standard']} B:{counts['background']} | Inference: {inference_ms:.1f}ms")
+
+    async def execute(self, batch: Batch):
+        if not batch.requests: return
+            
+        if not self.circuit_breaker.can_execute():
+            logger.warning("Worker unhealthy. Requeueing batch.")
+            for req in batch.requests: await self.fetcher.requeue_task(req)
+            return
+            
+        start_time = time.monotonic()
+        
+        try:
+            results = await asyncio.to_thread(self.processor_registry.run_inference, batch.requests)
+            
+            has_success = any(res.get("status") != "error" for res in results) if results else False
+            if has_success: self.circuit_breaker.record_success()
+            else: self.circuit_breaker.record_failure()
+            
+            for req, result_data in zip(batch.requests, results):
+                response_payload = {"request_id": req.request_id, "status": "success" if result_data.get("status") != "error" else "error", "data": result_data}
+                await self.redis.publish(f"response:{req.request_id}", json.dumps(response_payload))
+                await self.fetcher.complete_task(req.raw_data)
+                
+        except Exception as e:
+            self.circuit_breaker.record_failure()
+            logger.error(f"Fatal inference crash: {e}")
+            for req in batch.requests:
+                error_payload = {"request_id": req.request_id, "status": "error", "error": str(e)}
+                await self.redis.publish(f"response:{req.request_id}", json.dumps(error_payload))
+                await self.fetcher.complete_task(req.raw_data) # Remove from processing queue since we answered the client
+        finally:
+            self.log_metrics(batch, (time.monotonic() - start_time) * 1000)
+
+async def main():
+    start_http_server(8002)
+    
+    import redis.asyncio as redis_async
+    # FIX: Use REDIS_URL mapping from Phase 2
+    redis_client = redis_async.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    
+    heartbeat = HeartbeatEmitter(redis_client, worker_id=WORKER_ID)
+    await heartbeat.start()
+    
+    registry = DynamicModelRegistry()
+    task_fetcher = ReliableTaskFetcher(redis_client, worker_id=WORKER_ID, registry=registry)
+    scheduler = WRRScheduler(redis_client, task_fetcher)
+    batch_builder = BatchBuilder(scheduler, registry=registry)
+    worker = InferenceWorker(registry, redis_client, task_fetcher)
+    
+    shutdown_event = asyncio.Event()
+
+    def handle_shutdown(sig, frame):
+        logger.warning("Shutdown signal received. Finishing active batches...")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+
+    logger.info(f"Worker {WORKER_ID} started. Listening for requests...")
+    
+    while not shutdown_event.is_set():
+        batch = await batch_builder.build_next_batch(shutdown_event)
+        if batch and batch.requests:
+            await worker.execute(batch)
+            
+    await heartbeat.stop()
+    await redis_client.aclose()
+    logger.info("Worker shut down cleanly.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+================================================
+FILE: worker/requirements.txt
+================================================
+redis==5.0.1
+onnxruntime==1.17.0
+numpy==1.26.4
+pydantic-settings
+prometheus_client==0.20.0
+transformers
+
+psycopg2-binary
+scikit-learn>=1.3.0
+joblib>=1.3.0
+pandas>=2.0.0
+
+
+================================================
+FILE: worker/benchmarks/live_demo.py
+================================================
+import concurrent.futures
+import requests
+import time
+import random
+
+# Ensure this matches the port FastAPI will run on
+URL = "http://localhost:8000/predict"
+PRIORITIES = ["premium", "standard", "background"]
+WEIGHTS = [20, 50, 30] # 20% premium, 50% standard, 30% background
+
+def send_request(req_id: int):
+    priority = random.choices(PRIORITIES, weights=WEIGHTS)[0]
+    payload = {
+        "model_name": "sentiment_analyzer",
+        "priority": priority,
+        "user_tier": "user",
+        "payload": {"text": f"Simulating faculty demo request {req_id} for AeroServe."}
+    }
+    
+    start_time = time.time()
+    try:
+        response = requests.post(URL, json=payload)
+        latency = time.time() - start_time
+        
+        if response.status_code == 200:
+            print(f"[{priority.upper():<10}] HTTP 200 | Latency: {latency:.2f}s | Result: {response.json().get('inference_result')}")
+        else:
+            print(f"[{priority.upper():<10}] HTTP {response.status_code} | Latency: {latency:.2f}s | Error: {response.text}")
+            
+    except requests.exceptions.ConnectionError:
+        print(f"[{priority.upper():<10}] FAILED: Connection Refused (Is the Gateway running?)")
+
+def run_demo(total_requests=100, concurrency=15):
+    print(f"ðŸš€ Launching {total_requests} requests at {URL} with concurrency {concurrency}...")
+    
+    # Use ThreadPoolExecutor to simulate multiple users hitting the endpoint simultaneously
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(send_request, i) for i in range(total_requests)]
+        concurrent.futures.wait(futures)
+        
+    print("âœ… Demo load test complete.")
+
+if __name__ == "__main__":
+    # Simulate 100 requests with 15 concurrent connections
+    run_demo(total_requests=100, concurrency=15)
+
+
+================================================
+FILE: worker/tests/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: worker/tests/test_heartbeat.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: worker/tests/test_pipeline.py
+================================================
+import asyncio
+import logging
+import time
+
+import httpx
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("TestClient")
+
+API_URL = "http://localhost:8000/predict"
+
+async def send_request(client: httpx.AsyncClient, req_id: int, priority: str):
+    """Sends a single request and measures the exact round-trip latency."""
+    payload = {
+        "model_name": "test_model",
+        "priority": priority,
+        "payload": {"test_id": req_id}
+    }
+    start_time = time.time()
+    
+    try:
+        response = await client.post(API_URL, json=payload, timeout=12.0)
+        latency = (time.time() - start_time) * 1000
+        
+        if response.status_code == 200:
+            logger.info(f"✅ [Req {req_id:03d} | {priority[:4].upper()}] Success in {latency:.0f}ms")
+            return {"status": "success", "latency": latency, "priority": priority}
+        else:
+            logger.error(f"❌ [Req {req_id:03d} | {priority[:4].upper()}] Failed: HTTP {response.status_code}")
+            return {"status": "error", "code": response.status_code}
+            
+    except httpx.ReadTimeout:
+        logger.error(f"❌ [Req {req_id:03d} | {priority[:4].upper()}] Gateway Timeout (Client Side)")
+        return {"status": "timeout"}
+
+async def run_scenario_1_basic(client):
+    logger.info("--- SCENARIO 1: Basic End-to-End ---")
+    await send_request(client, 1, "premium")
+    await asyncio.sleep(1)
+
+async def run_scenario_2_mixed_batch(client):
+    logger.info("\n--- SCENARIO 2: Mixed Batch (High-Water Mark Timeout) ---")
+    # Send 1 Premium, 2 Standard, 2 Background simultaneously.
+    # The worker should group them into ONE batch of 5.
+    # The whole batch must execute in <50ms because of the Premium request!
+    tasks = [
+        send_request(client, 10, "premium"),
+        send_request(client, 11, "standard"),
+        send_request(client, 12, "standard"),
+        send_request(client, 13, "background"),
+        send_request(client, 14, "background")
+    ]
+    await asyncio.gather(*tasks)
+    await asyncio.sleep(1)
+
+async def run_scenario_3_max_batch_overflow(client):
+    logger.info("\n--- SCENARIO 3: MAX_BATCH_SIZE (Overflow) ---")
+    # MAX_BATCH_SIZE is 16. We will send 20 requests at the exact same time.
+    # We should see the worker process one batch of 16, then a batch of 4.
+    tasks = [send_request(client, 20 + i, "standard") for i in range(20)]
+    results = await asyncio.gather(*tasks)
+    
+    successes = sum(1 for r in results if r["status"] == "success")
+    logger.info(f"Result: {successes}/20 requests processed successfully.")
+    await asyncio.sleep(1)
+
+async def run_scenario_4_wrr_fairness(client):
+    logger.info("\n--- SCENARIO 4: WRR Fairness Under Heavy Load ---")
+    # Flood the system with 30 Premium requests, but sneak in 5 Background requests.
+    # Even though Premium is flooded, the 5:3:1 WRR should ensure Background requests
+    # get processed WITHOUT having to wait for all 30 Premium requests to finish.
+    tasks = []
+    for i in range(30):
+        tasks.append(send_request(client, 100 + i, "premium"))
+    for i in range(5):
+        tasks.append(send_request(client, 200 + i, "background"))
+        
+    await asyncio.gather(*tasks)
+
+async def main():
+    async with httpx.AsyncClient() as client:
+        await run_scenario_1_basic(client)
+        await run_scenario_2_mixed_batch(client)
+        await run_scenario_3_max_batch_overflow(client)
+        await run_scenario_4_wrr_fairness(client)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+================================================
+FILE: worker/tests/test_worker.py
+================================================
+import pytest
+
+from models.aeroserve_preprocessor import AeroServeCustomProcessor
+from worker.main import process_task
+
+
+class ExplodingProcessor(AeroServeCustomProcessor):
+    def execute(self, payload: dict) -> dict:
+        _ = payload["missing_key"] 
+        return {"result": "success"}
+
+@pytest.fixture
+def mock_hybrid_processor():
+    return ExplodingProcessor()
+
+@pytest.fixture
+def mock_session():
+    class DummySession:
+        def run(self, *args, **kwargs):
+            return [[0.99]]
+    return DummySession()
+
+@pytest.mark.asyncio
+async def test_worker_survives_bad_input(mock_hybrid_processor, mock_session):
+    bad_task = {"request_id": "req-123", "payload": {"corrupted": "data"}}
+    
+    result = await process_task(mock_hybrid_processor, mock_session, bad_task)
+    
+    assert result["status"] == "error"
+    assert "error" in result
+    assert result["request_id"] == "req-123"
+

@@ -1,0 +1,4 @@
+[tool.ruff.lint]
+# B008: Allow Depends() in FastAPI routes
+# BLE001: Allow catching broad Exceptions for health checks
+extend-ignore = ["B008", "BLE001"]

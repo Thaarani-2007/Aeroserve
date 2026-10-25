@@ -1,0 +1,11 @@
+redis==5.0.1
+onnxruntime==1.17.0
+numpy==1.26.4
+pydantic-settings
+prometheus_client==0.20.0
+transformers
+
+psycopg2-binary
+scikit-learn>=1.3.0
+joblib>=1.3.0
+pandas>=2.0.0
