@@ -1,0 +1,27 @@
+{
+    "model_name": "iris_model",
+    "version": "1.0.0",
+    "framework": "custom",
+    "processor": {
+        "file": "processor.py",
+        "class_name": "IrisProcessor"
+    },
+    "batching": {
+        "max_batch_size": 64,
+        "batch_timeout_ms": 15
+    },
+    "slas": {
+        "expected_inference_ms": 17,
+        "max_queue_wait_s": 10.0,
+        "priority_timeouts_s": {
+            "premium": 3.0,
+            "standard": 10.0,
+            "background": 30.0
+        }
+    },
+    "autoscaling": {
+        "min_workers": 1,
+        "max_workers": 84,
+        "target_queue_per_worker": 128
+    }
+}

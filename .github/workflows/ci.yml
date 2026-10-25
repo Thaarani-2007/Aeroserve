@@ -1,0 +1,66 @@
+name: AeroServe CI Pipeline
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install All Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r gateway/requirements.txt
+          pip install -r worker/requirements.txt
+          # Add scheduler requirements if you created a separate requirements file for it
+          # pip install -r scheduler/requirements.txt 
+          pip install pytest pytest-asyncio fakeredis httpx
+
+      - name: 1. Run Ruff Linter
+        run: |
+          ruff check gateway/
+          ruff check worker/
+          ruff check scheduler/
+
+      - name: 2. Run Isolated Unit Tests (Circuit Breaker & Fetcher)
+        env:
+          PYTHONPATH: .
+        run: |
+          python -m pytest tests/unit/ -v
+
+      - name: 3. Validate Docker Compose Config
+        run: |
+          docker compose config -q
+
+      - name: 4. Build Docker Containers
+        run: |
+          docker compose build
+
+      - name: 5. Run Live End-to-End Chaos Test
+        env:
+          PYTHONPATH: .
+        run: |
+          # Bring up the full platform in the background (scale worker to 2 for resilience)
+          docker compose up -d --scale worker=2
+          
+          # Poll the health endpoint until the gateway is ready
+          timeout 30 bash -c 'while [[ "$(curl -s -o /dev/null -w ''%{http_code}'' localhost:8000/health)" != "200" ]]; do sleep 2; done' || false
+          
+          # Execute the live resilience script we just built!
+          python tests/e2e/test_live_resilience.py
+          
+          # Clean up infrastructure
+          docker compose down

@@ -1,0 +1,409 @@
+Directory structure:
+└── SDE project/
+    ├── README.md
+    ├── iris_classifier/
+    │   ├── iris_pipeline.joblib
+    │   ├── model_config.json
+    │   ├── processor.py
+    │   └── test_inputs.json
+    └── .github/
+        ├── PULL_REQUEST_TEMPLATE.md
+        └── workflows/
+            └── ci.yml
+
+================================================
+FILE: README.md
+================================================
+# Registering a Model with AeroServe
+
+## 1. Overview
+
+AeroServe is an ML inference serving platform that helps developers register their machine learning models, profile their performance, and serve predictions through an API.
+
+As an ML developer, you provide your model's inference implementation, sample inputs, and required model assets. AeroServe profiles the model, generates a configuration, and registers the model for serving.
+
+## 2. Prerequisites
+
+Before registering a model, ensure you have:
+
+- Python installed with the dependencies required by your model.
+- Docker and Docker Compose installed.
+- The AeroServe CLI and platform services available.
+- A model implementation compatible with the AeroServe processor interface.
+- Representative sample inputs for testing and profiling.
+
+**Important:** AeroServe must support the framework and dependencies required by your model. Specifying a framework does not automatically install its dependencies.
+
+## 3. Prepare Your Model Package
+
+Create a directory containing your inference processor, test inputs, and model assets.
+
+Example:
+
+```text
+my_model/
+â”œâ”€â”€ processor.py
+â”œâ”€â”€ test_inputs.json
+â”œâ”€â”€ weights/
+â”‚   â””â”€â”€ model_weights.bin
+â””â”€â”€ tokenizer/
+    â””â”€â”€ tokenizer_config.json
+```
+
+Your package may contain different files depending on your model. The weights and tokenizer shown above are examples.
+
+### A. Implement `processor.py`
+
+Your processor connects your model to AeroServe's inference interface.
+
+For a custom processor, inherit from `AeroServeCustomProcessor` and implement `execute()`.
+
+```python
+from models.aeroserve_preprocessor import AeroServeCustomProcessor
+
+class SentimentProcessor(AeroServeCustomProcessor):
+    def __init__(self):
+        # Load your model and required assets here.
+        pass
+
+    def execute(self, payload: dict) -> dict:
+        # Preprocess input, run inference,
+        # and format the prediction.
+        return {
+            "prediction": "positive"
+        }
+```
+
+This is an illustrative example. Replace the placeholder with your actual model-loading and inference logic.
+
+Your implementation must return a dictionary that can be serialized to JSON. The processor must follow the interface and batching requirements supported by your AeroServe version.
+
+### B. Create `test_inputs.json`
+
+Provide a non-empty JSON array containing representative inputs that your model can process.
+
+```json
+[
+  {
+    "text": "The product is excellent."
+  },
+  {
+    "text": "The service was disappointing."
+  }
+]
+```
+
+Each object must match the input format expected by your processor. AeroServe uses these examples to validate the model interface and profile inference performance.
+
+Do not include confidential or sensitive production data in test inputs.
+
+### C. Include model assets
+
+Include the files needed to load and run your model, such as model weights, tokenizer files, configuration files, or other assets.
+
+Ensure your processor loads assets using paths that work in the deployed model directory.
+
+## 4. Register Your Model Using the CLI
+
+Run the following command from the AeroServe project root:
+
+```bash
+python cli.py submit \
+  --model-dir ./my_model \
+  --name sentiment_analyzer \
+  --framework transformers \
+  --processor-class SentimentProcessor
+```
+
+Replace the example values with your own.
+
+| Argument | Description |
+|---|---|
+| `--model-dir` | Directory containing `processor.py`, `test_inputs.json`, and required model assets. |
+| `--name` | Unique registry name used to identify the model. |
+| `--framework` | Supported inference runtime or framework selected for your model. |
+| `--processor-class` | Exact processor class name defined in `processor.py`. Optional if AeroServe can uniquely identify the processor. |
+| `--sla` | Optional target latency in milliseconds used during profiling. |
+
+Use a framework choice supported by your AeroServe runtime. The CLI's current choices are `transformers`, `pytorch`, `tensorflow`, `onnx`, and `custom`.
+
+## 5. What AeroServe Does During Registration
+
+When you submit your model, AeroServe is intended to perform the following steps:
+
+1. **Validate the package:** Check that the processor and test inputs exist and that the test inputs contain valid JSON.
+2. **Load the processor:** Import the selected processor class and instantiate it.
+3. **Validate inference:** Execute test inputs and check that outputs follow the required format.
+4. **Profile performance:** Measure inference latency, throughput, and memory usage across supported batch sizes.
+5. **Generate configuration:** Create `model_config.json` containing the selected batch size, batching timeout, latency estimate, priority timeouts, and worker limits.
+6. **Register the model:** Copy the model package into AeroServe's model registry.
+7. **Verify availability:** Check that the gateway responds. A successful gateway health check alone does not guarantee that the submitted model is loaded or that inference succeeds.
+
+**Registration status:** The current CLI implementation should be treated as a prototype. Before claiming full deployment verification, AeroServe should confirm that the specific model is registered, loaded by a worker, and able to return a successful test prediction.
+
+## 6. Send a Prediction Request
+
+Once the model is registered and available, a client application can send a prediction request to the AeroServe gateway.
+
+Example request:
+
+```http
+POST http://localhost:8000/predict
+Content-Type: application/json
+```
+
+Illustrative request body:
+
+```json
+{
+  "model_name": "sentiment_analyzer",
+  "input": {
+    "text": "The product is excellent."
+  }
+}
+```
+
+The exact request fields and endpoint must match the prediction schema implemented by your AeroServe gateway.
+
+Example response:
+
+```json
+{
+  "prediction": "positive"
+}
+```
+
+The response is illustrative; actual output depends on the registered model and gateway response schema.
+
+## 7. Troubleshooting
+
+- **Missing processor:** Confirm that `processor.py` exists in the model directory.
+- **Invalid test inputs:** Ensure `test_inputs.json` contains a non-empty JSON array of inputs accepted by your processor.
+- **Processor loading error:** Verify the class name, imports, dependencies, and inheritance from the required AeroServe base class.
+- **Profiling failure:** Check model initialization, available memory, device compatibility, and whether the requested latency target can be met.
+- **Model unavailable after registration:** Confirm that the gateway and workers can access the registered model directory and that the runtime refreshes or reloads its model registry.
+- **Prediction failure:** Verify the gateway's request schema, model name, processor output format, and worker logs.
+
+## 8. Important Notes
+
+- Register only models and code that you are authorized to deploy.
+- Model code executes during loading and inference. Only register trusted code; profiling should be isolated from the platform in a production deployment.
+- Model profiling provides estimates based on the tested hardware and inputs. It does not guarantee production latency or throughput.
+- Keep your model package and dependencies compatible with the AeroServe runtime.
+
+
+
+================================================
+FILE: iris_classifier/iris_pipeline.joblib
+================================================
+[Binary file]
+
+
+================================================
+FILE: iris_classifier/model_config.json
+================================================
+{
+    "model_name": "iris_model",
+    "version": "1.0.0",
+    "framework": "custom",
+    "processor": {
+        "file": "processor.py",
+        "class_name": "IrisProcessor"
+    },
+    "batching": {
+        "max_batch_size": 64,
+        "batch_timeout_ms": 27
+    },
+    "slas": {
+        "expected_inference_ms": 54,
+        "max_queue_wait_s": 10.0,
+        "priority_timeouts_s": {
+            "premium": 3.0,
+            "standard": 10.0,
+            "background": 30.0
+        }
+    },
+    "autoscaling": {
+        "min_workers": 1,
+        "max_workers": 42,
+        "target_queue_per_worker": 128
+    }
+}
+
+
+================================================
+FILE: iris_classifier/processor.py
+================================================
+import os
+import joblib
+import numpy as np
+import time
+from typing import Any, Dict, List
+
+# Import the base class expected by AeroServe
+from models.aeroserve_preprocessor import AeroServeProcessor
+
+class IrisProcessor(AeroServeProcessor):
+    # Enable AeroServe's dynamic batching engine
+    supports_batching = True
+
+    def __init__(self):
+        # Resolve path dynamically so it works inside the Docker worker volume
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        artifact_path = os.path.join(current_dir, "iris_pipeline.joblib")
+        
+        print(f"Loading Iris Model and Scaler from {artifact_path}...")
+        artifacts = joblib.load(artifact_path)
+        self.model = artifacts['model']
+        self.scaler = artifacts['scaler']
+
+    def execute(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Handles a single inference request."""
+        features = payload.get("features")
+        
+        if not features or len(features) != 4:
+            return {"status": "error", "error": "Payload must contain a 'features' array of exactly 4 numeric values."}
+        
+        # Reshape for sklearn (1 sample, 4 features)
+        X = np.array([features])
+        X_scaled = self.scaler.transform(X)
+        prediction = self.model.predict(X_scaled)[0]
+        
+        return {"status": "success", "prediction": str(prediction)}
+
+    def execute_batch(self, payloads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Handles dynamically batched requests for high throughput."""
+        time.sleep(10)
+        X_list = []
+        valid_indices = []
+        
+        # Initialize default error responses
+        results = [{"status": "error", "error": "Invalid features array"} for _ in payloads]
+        
+        for idx, p in enumerate(payloads):
+            feats = p.get("features")
+            if feats and len(feats) == 4:
+                X_list.append(feats)
+                valid_indices.append(idx)
+        
+        # Perform vectorized inference on valid payloads
+        if X_list:
+            X_array = np.array(X_list)
+            X_scaled = self.scaler.transform(X_array)
+            predictions = self.model.predict(X_scaled)
+            
+            # Map predictions back to their original positions in the batch
+            for i, pred_val in enumerate(predictions):
+                original_idx = valid_indices[i]
+                results[original_idx] = {"status": "success", "prediction": str(pred_val)}
+                
+        return results
+
+
+================================================
+FILE: iris_classifier/test_inputs.json
+================================================
+[
+    {
+        "features": [5.1, 3.5, 1.4, 0.2]
+    },
+    {
+        "features": [6.7, 3.0, 5.2, 2.3]
+    },
+    {
+        "features": [5.9, 3.0, 5.1, 1.8]
+    },
+    {
+        "features": [4.9, 3.0, 1.4, 0.2]
+    }
+]
+
+
+================================================
+FILE: .github/PULL_REQUEST_TEMPLATE.md
+================================================
+### Description
+<!-- Provide a brief overview of the changes introduced by this PR. -->
+
+### User Story / Requirement Addressed
+<!-- Link to the Sprint user story or issue. -->
+
+### Test Evidence
+- [ ] Unit tests added/updated and passing locally
+- [ ] Integration tests executed against Docker Compose stack
+- [ ] Linter (`ruff check`) passed without warnings
+- [ ] CI pipeline passes on feature branch
+
+<!-- Paste screenshot or terminal output of test evidence below -->
+
+
+================================================
+FILE: .github/workflows/ci.yml
+================================================
+name: AeroServe CI Pipeline
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install All Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r gateway/requirements.txt
+          pip install -r worker/requirements.txt
+          # Add scheduler requirements if you created a separate requirements file for it
+          # pip install -r scheduler/requirements.txt 
+          pip install pytest pytest-asyncio fakeredis httpx
+
+      - name: 1. Run Ruff Linter
+        run: |
+          ruff check gateway/
+          ruff check worker/
+          ruff check scheduler/
+
+      - name: 2. Run Isolated Unit Tests (Circuit Breaker & Fetcher)
+        env:
+          PYTHONPATH: .
+        run: |
+          python -m pytest tests/unit/ -v
+
+      - name: 3. Validate Docker Compose Config
+        run: |
+          docker compose config -q
+
+      - name: 4. Build Docker Containers
+        run: |
+          docker compose build
+
+      - name: 5. Run Live End-to-End Chaos Test
+        env:
+          PYTHONPATH: .
+        run: |
+          # Bring up the full platform in the background (scale worker to 2 for resilience)
+          docker compose up -d --scale worker=2
+          
+          # Poll the health endpoint until the gateway is ready
+          timeout 30 bash -c 'while [[ "$(curl -s -o /dev/null -w ''%{http_code}'' localhost:8000/health)" != "200" ]]; do sleep 2; done' || false
+          
+          # Execute the live resilience script we just built!
+          python tests/e2e/test_live_resilience.py
+          
+          # Clean up infrastructure
+          docker compose down
+
